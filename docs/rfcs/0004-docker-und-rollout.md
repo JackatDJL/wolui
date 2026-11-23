@@ -40,7 +40,7 @@ CI umfasst Format, Lint, Rust- und Client-Builds, API-Vertragsprüfung, Containe
 
 ## Umsetzung und Freigabepunkte
 
-1. **Lokaler Schnitt.** Cargo- und pnpm-Workspace, Browser-Login, Geräteverwaltung, Wake und Docker-Image. Freigabe nach Paketprüfung plus realem Wake und Datenpersistenz.
+1. **Lokaler Schnitt.** Cargo- und Bun-Workspace, Browser-Login, Geräteverwaltung, Wake und Docker-Image. Freigabe nach Paketprüfung plus realem Wake und Datenpersistenz.
 2. **WOL Connect.** Kopplung, Hub-Übersicht, lokale Rechte, Wiederverbindung und Audit. Freigabe nach isoliertem Mehrstandorttest und Widerrufstest.
 3. **Betreibbarer Release.** Compose-Beispiele, Registry-Veröffentlichung, Backup- und Upgrade-Anleitung, Geräteanleitungen sowie ein Referenzbetrieb mit Hub und einer Standortinstanz. Schule kommt hinzu, sobald die Freigabe vorliegt.
 4. **Expo.** Native Android- und iOS-Builds, Sitzungen, Serverauswahl, Startaktion und Browser-Übergabe. Freigabe nach Prüfung auf beiden Plattformen.

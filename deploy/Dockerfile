@@ -1,12 +1,14 @@
 # Build with the repository root as the Docker context:
 # docker build -f deploy/Dockerfile .
-FROM node:22-bookworm-slim AS web-build
+FROM oven/bun:1.4.4 AS web-build
 WORKDIR /workspace
 
-RUN corepack enable
-COPY . .
-RUN pnpm install --frozen-lockfile \
-    && pnpm --dir apps/web build
+COPY package.json bun.lock ./
+COPY apps/web/package.json apps/web/package.json
+RUN bun install --frozen-lockfile
+
+COPY apps/web apps/web
+RUN bun run --filter @wolui/web build
 
 FROM rust:1-bookworm AS server-build
 WORKDIR /workspace

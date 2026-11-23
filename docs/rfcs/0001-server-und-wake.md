@@ -19,7 +19,7 @@ Ein Linux-Rechner stellt Weboberfläche und API bereit, speichert Geräte dauerh
 | `deploy/` | Dockerfile, Compose-Profile und Beispiele für den TLS-Reverse-Proxy |
 | `docs/` | RFCs, Geräteanleitungen und Betrieb |
 
-Cargo Workspace für Rust und pnpm Workspace für TypeScript. Axum ist die vorgeschlagene Zuordnung zu Tokio.rs. Tower übernimmt HTTP-Middleware, Serde die Serialisierung, tracing strukturierte Logs und SQLx Migrationen und Zugriff auf SQLite. Axum liefert das Vite-Build aus demselben Prozess aus. Der Cargo-Build übernimmt die fertigen Web-Assets. API- und Asset-Routen bleiben von der SPA-Fallback-Route getrennt. Festgeschriebene Lockfiles und Toolchains machen Builds nachvollziehbar. Actix Web wäre eine Alternative für HTTP. Next.js bringt für diese angemeldete Oberfläche wenig zusätzlichen Nutzen, da keine serverseitige Seitenerzeugung geplant ist.
+Cargo Workspace für Rust und Bun Workspace für TypeScript. Axum ist die vorgeschlagene Zuordnung zu Tokio.rs. Tower übernimmt HTTP-Middleware, Serde die Serialisierung, tracing strukturierte Logs und SQLx Migrationen und Zugriff auf SQLite. Axum liefert das Vite-Build aus demselben Prozess aus. Der Cargo-Build übernimmt die fertigen Web-Assets. API- und Asset-Routen bleiben von der SPA-Fallback-Route getrennt. Festgeschriebene Lockfiles und Toolchains machen Builds nachvollziehbar. Actix Web wäre eine Alternative für HTTP. Next.js bringt für diese angemeldete Oberfläche wenig zusätzlichen Nutzen, da keine serverseitige Seitenerzeugung geplant ist.
 
 ## Daten und API
 

@@ -1,9 +1,12 @@
 {
   "name": "wolui",
   "private": true,
-  "packageManager": "pnpm@9.15.4",
+  "packageManager": "bun@1.4.4",
+  "workspaces": [
+    "apps/*"
+  ],
   "scripts": {
-    "dev": "pnpm --filter @wolui/web dev",
-    "build": "pnpm --filter @wolui/web build"
+    "dev": "bun run --filter @wolui/web dev",
+    "build": "bun run --filter @wolui/web build"
   }
 }

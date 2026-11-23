@@ -9,7 +9,6 @@ Teil dieses Referenzbetriebs.
 ## Voraussetzungen
 
 - Linux mit Docker Engine und Docker Compose v2
-- pnpm/Cargo-Workspace im Repository (siehe RFC 0001)
 - Ein LAN-Interface im gewünschten Zielsegment
 - Freier Listener-Port, standardmäßig `127.0.0.1:3000`
 
@@ -74,16 +73,17 @@ docker compose -f deploy/compose.yaml start wolui
 Zum Wiederherstellen zuerst den Container stoppen, dann das Archiv nach
 `deploy/data` entpacken und den Container erneut starten. Vor einem Upgrade
 Image und Daten gemeinsam aufbewahren, damit ein Rollback mit passendem
-Datenstand möglich bleibt. Ein produktiver Backup-/Restore-Probeablauf und
-versionierte Images sind noch nicht eingerichtet.
+Datenstand möglich bleibt. Ein produktiver Backup-/Restore-Probeablauf ist noch
+nicht eingerichtet.
 
 ## Entwicklungsnotizen
 
-Das Image wird aus dem Repository-Root gebaut. Es erwartet `pnpm-lock.yaml`,
-`pnpm-workspace.yaml`, `apps/web`, ein Cargo-Workspace und das Paket `wol-server`.
+Das Image wird aus dem Repository-Root gebaut. Es erwartet `package.json`,
+`bun.lock`, `apps/web`, ein Cargo-Workspace und das Paket `wol-server`.
 GitHub Actions prüft Web und Rust sowie den Start eines Linux/amd64-Containers,
 die ausgelieferte Oberfläche und die Anmeldung. Nach einem erfolgreichen
 Build auf `main` schiebt der Workflow das getestete Image als
-`ghcr.io/jackatdjl/wolui:sha-<commit>` in die GitHub Container Registry.
+`ghcr.io/jackatdjl/wolui:sha-<commit>` und `ghcr.io/jackatdjl/wolui:latest`
+in die GitHub Container Registry.
 Das Compose-Beispiel baut lokal aus dem Checkout. Hub-Betrieb und ARM64-Images
 sind weitere Meilensteine.

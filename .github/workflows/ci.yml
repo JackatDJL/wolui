@@ -18,15 +18,13 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v5
+      - uses: oven-sh/setup-bun@v2
         with:
-          node-version: '22'
-          package-manager-cache: false
+          bun-version: 1.4.4
       - name: Build web app
         run: |
-          corepack enable
-          pnpm install --frozen-lockfile
-          pnpm build
+          bun install --frozen-lockfile
+          bun run build
       - name: Test Rust workspace
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt
@@ -37,6 +35,9 @@ jobs:
     name: Docker image and smoke test
     runs-on: ubuntu-latest
     needs: verify
+    concurrency:
+      group: ${{ github.workflow }}-ghcr-${{ github.ref }}
+      cancel-in-progress: false
     timeout-minutes: 30
     permissions:
       contents: read
@@ -87,5 +88,55 @@ jobs:
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker tag wolui:ci "$image:sha-$GITHUB_SHA"
-          docker push "$image:sha-$GITHUB_SHA"
+          sha_image="$image:sha-$GITHUB_SHA"
+          sha_error=$(mktemp)
+          if docker buildx imagetools inspect "$sha_image" >/dev/null 2>"$sha_error"; then
+            echo "Reusing existing immutable image $sha_image"
+            docker pull "$sha_image"
+          elif grep -Fxq -- "ERROR: $sha_image: not found" "$sha_error"; then
+            docker tag wolui:ci "$sha_image"
+            docker push "$sha_image"
+          else
+            cat "$sha_error" >&2
+            exit 1
+          fi
+          rm -f "$sha_error"
+
+          latest_image="$image:latest"
+          latest_error=$(mktemp)
+          if docker buildx imagetools inspect "$latest_image" >/dev/null 2>"$latest_error"; then
+            docker pull "$latest_image"
+            latest_revision=$(docker image inspect "$latest_image" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+            if [[ -z "$latest_revision" ]]; then
+              echo "The existing latest image has no revision label; refusing to replace it" >&2
+              exit 1
+            fi
+            comparison=$(curl --fail --silent --show-error \
+              -H "Authorization: Bearer $GHCR_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/compare/$latest_revision...$GITHUB_SHA")
+            comparison_status=$(jq -er '.status' <<< "$comparison")
+            case "$comparison_status" in
+              ahead)
+                docker tag "$sha_image" "$latest_image"
+                docker push "$latest_image"
+                ;;
+              identical)
+                echo "latest already points to $GITHUB_SHA"
+                ;;
+              behind|diverged)
+                echo "Keeping latest at $latest_revision; $GITHUB_SHA is not newer"
+                ;;
+              *)
+                echo "Unexpected commit comparison status: $comparison_status" >&2
+                exit 1
+                ;;
+            esac
+          elif grep -Fxq -- "ERROR: $latest_image: not found" "$latest_error"; then
+            docker tag "$sha_image" "$latest_image"
+            docker push "$latest_image"
+          else
+            cat "$latest_error" >&2
+            exit 1
+          fi
+          rm -f "$latest_error"

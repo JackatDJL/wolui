@@ -1,0 +1,36 @@
+services:
+  wolui:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: wolui:local
+    container_name: wolui-site
+    command: ["--allow-loopback-dev"]
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      WOLUI_ROLE: site
+      WOLUI_LISTEN: 127.0.0.1:3000
+      WOLUI_PUBLIC_URL: http://localhost:3000
+      WOLUI_DATA_DIR: /data
+      WOLUI_ACCESS_TOKEN_FILE: /run/secrets/wolui_access_token
+      WOLUI_LOG: ${WOLUI_LOG:-info}
+      WOLUI_WEB_DIR: /opt/wolui/web
+      WOLUI_NETWORK_PROFILES: ${WOLUI_NETWORK_PROFILES:-[]}
+    volumes:
+      - ./data:/data
+      - ./secrets/access-token:/run/secrets/wolui_access_token:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    user: "10001:10001"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:3000/health/ready"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3

@@ -1,0 +1,11 @@
+.git
+.git/**
+**/node_modules
+**/target
+**/dist
+**/*.tsbuildinfo
+**/.env
+deploy/data
+deploy/secrets
+*.log
+.DS_Store

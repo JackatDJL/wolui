@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Rust and web
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Build web app
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: Test Rust workspace
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          cargo +stable fmt --all -- --check
+          cargo +stable test --workspace --locked
+
+  image:
+    name: Docker image and smoke test
+    runs-on: ubuntu-latest
+    needs: verify
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Build image
+        run: |
+          docker compose -f deploy/compose.yaml config --quiet
+          docker build -f deploy/Dockerfile \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t wolui:ci .
+      - name: Smoke-test the Docker image
+        run: |
+          set -euo pipefail
+          scratch=$(mktemp -d)
+          container=wolui-smoke
+          trap 'docker rm -f -v "$container" >/dev/null 2>&1 || true; rm -rf "$scratch"' EXIT
+          openssl rand -hex 32 > "$scratch/token"
+          chmod 0444 "$scratch/token"
+          docker run -d --name "$container" --network host --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --mount "type=bind,source=$scratch/token,target=/run/secrets/wolui_access_token,readonly" \
+            --tmpfs /data:rw,uid=10001,gid=10001,mode=0700 \
+            -e WOLUI_PUBLIC_URL=http://localhost:3000 wolui:ci
+          url=http://localhost:3000
+          if ! curl --retry 25 --retry-connrefused --retry-delay 1 --fail --silent --show-error "$url/health/ready"; then
+            docker logs "$container"
+            exit 1
+          fi
+          curl --fail --silent --show-error "$url/" -o "$scratch/index.html"
+          grep -Fq '<div id="root"></div>' "$scratch/index.html"
+          jq -Rn --rawfile token "$scratch/token" '{token: ($token | rtrimstr("\n"))}' |
+            curl --fail --silent --show-error --cookie-jar "$scratch/cookies" \
+              -H 'Content-Type: application/json' -H "Origin: $url" \
+              --data-binary @- "$url/api/v1/sessions" |
+            jq -e '.csrf_token | length > 0'
+          curl --fail --silent --show-error --cookie "$scratch/cookies" "$url/api/v1/sites" |
+            jq -e 'length == 1 and (.[0].id | length > 0)'
+      - name: Publish tested image to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag wolui:ci "$image:sha-$GITHUB_SHA"
+          docker push "$image:sha-$GITHUB_SHA"

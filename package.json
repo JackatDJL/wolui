@@ -1,0 +1,9 @@
+{
+  "name": "wolui",
+  "private": true,
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "dev": "pnpm --filter @wolui/web dev",
+    "build": "pnpm --filter @wolui/web build"
+  }
+}

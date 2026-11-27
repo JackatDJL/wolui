@@ -2,6 +2,36 @@
 
 WOL Connect verbindet einen Hub mit lokalen Standortinstanzen. Der Hub braucht eine öffentliche HTTPS-Adresse. Die Standortserver öffnen selbst eine ausgehende Verbindung zum Hub; für das Heimnetz ist kein eingehender Port nötig. Jeder Standort braucht ein eigenes persistentes Datenvolume und sein Netzwerkprofil für das lokale LAN.
 
+## Browser-Terminal über Tailscale SSH
+
+Der Hub kann ein Terminal im Browser öffnen und `tailscale ssh` als Gateway-Client ausführen. Das gilt für lokale und verbundene Geräte, deren Tailscale-Name aus dem Standortinventar bekannt ist. Dafür muss der Hub den Tailscale-CLI-Prozess und dessen `tailscaled`-Socket erreichen können. Das Image enthält den CLI-Client; der Tailscale-Daemon und seine Socket-Freigabe werden separat betrieben.
+
+Aktiviere den Gateway auf dem Hub:
+
+```dotenv
+WOLUI_SSH_ENABLED=true
+WOLUI_TAILSCALE_BIN=/usr/local/bin/tailscale
+WOLUI_TAILSCALE_SOCKET=/var/run/tailscale/tailscaled.sock
+WOLUI_PUBLIC_URL=https://wolui.example.com
+```
+
+Stelle dem Container den Socket eines angemeldeten Tailscale-Daemons unter dem konfigurierten Pfad bereit. Der WOL UI Prozess läuft als UID `10001`; er braucht sowohl Dateisystemzugriff auf den Socket als auch die Berechtigung, den lokalen Tailscale-Daemon zu bedienen. Bei einer vorhandenen Host-Installation kann das Compose beispielsweise so aussehen; setze die ergänzende Gruppen-ID passend zu deinem Socket:
+
+```yaml
+services:
+  wolui:
+    group_add:
+      - "${WOLUI_TAILSCALE_SOCKET_GID}"
+    volumes:
+      - /var/run/tailscale:/var/run/tailscale:ro
+```
+
+Ein eigener Tailscale-Daemon oder Sidecar mit persistentem State ist eine gute Wahl, damit der Hub eine dedizierte Geräteidentität hat. Gib dieser Identität nur die SSH-Zugriffe, die der Hub benötigt. Der lokale Daemon muss den WOL UI Prozess zudem als berechtigten CLI-Operator zulassen, falls dessen LocalAPI das für `tailscale ssh` verlangt. Der Tailscale-Operator ist eine ausdrückliche lokale Berechtigung; folge dafür der [Tailscale-CLI-Dokumentation](https://tailscale.com/docs/reference/tailscale-cli).
+
+Bearbeite das Gerät an seinem Standort, trage den MagicDNS-Namen oder die Tailscale-IP und den Zielbenutzer ein und aktiviere **Tailscale SSH erlauben**. Bei Remote-Geräten wird diese Freigabe mit dem Inventar zum Hub synchronisiert. Die Aktion erscheint nur bei ausdrücklich freigegebenen Geräten und wenn `WOLUI_SSH_ENABLED=true` auf dem Hub aktiv ist. Auf dem Ziel müssen Tailscale SSH und passende SSH-Regeln der Tailnet-Policy eingerichtet sein. Tailscale SSH unterstützt derzeit Linux- und macOS-Ziele. Der [Tailscale-CLI-Client prüft den SSH-Host-Key gegen den vom Tailnet angekündigten Schlüssel](https://tailscale.com/docs/reference/tailscale-cli#ssh).
+
+Die Webanmeldung übernimmt nicht die Identität des eingeloggten Nutzers im Tailnet: Tailscale autorisiert die Verbindung anhand der Gateway-Identität. Der WOL UI Zugangstoken ist derzeit ein gemeinsamer Administratorzugang. Exponiere das öffentliche Interface daher nur den Personen, denen du diese Gateway-Rechte geben willst. Das Audit speichert Geräte-/Standort-ID, Zeit und Ergebnis, aber keine Terminaleingaben oder -ausgaben. Pro Hub sind höchstens vier gleichzeitige Terminals und 15 Minuten Leerlauf pro Sitzung erlaubt.
+
 ## Hub einrichten
 
 Setze auf der zentralen Instanz:
@@ -59,6 +89,7 @@ In Dokploy kannst du für jede Instanz dasselbe Repository und dasselbe Dockerfi
 - Für den Hub: `WOLUI_ROLE=hub`, `WOLUI_LISTEN=0.0.0.0:3000`, öffentliche `WOLUI_PUBLIC_URL`, persistentes `/data` und das Zugangstoken-Secret.
 - Für eine Site: `WOLUI_ROLE=site`, `WOLUI_SITE_NAME`, `WOLUI_CONNECT_URL`, persistentes `/data`, `WOLUI_NETWORK_PROFILES` und beim ersten Start ein schreibgeschütztes Mount für das Einladungstoken.
 - Auf beiden Instanzen muss Dokploy `/data` dauerhaft speichern. Beim Site-Container muss das LAN erreichbar sein; für Docker Engine auf Linux ist dafür Host Networking die vorgesehene Referenz. Reverse Proxy und TLS werden nur am Hub benötigt.
+- Für Browser-SSH am Hub zusätzlich `WOLUI_SSH_ENABLED=true` setzen und den `tailscaled`-Socket samt Zugriffsrechten bereitstellen. Ohne diese Option bleibt das Terminal deaktiviert.
 
 Lege in Dokploy keine `latest`-Tags als einzige Release-Referenz fest, wenn du kontrollierte Rollbacks brauchst. Das CI veröffentlicht `ghcr.io/jackatdjl/wolui:latest` und `ghcr.io/jackatdjl/wolui:sha-<commit>`; verwende den SHA-Tag für eine reproduzierbare Bereitstellung.
 
@@ -69,4 +100,4 @@ Lege in Dokploy keine `latest`-Tags als einzige Release-Referenz fest, wenn du k
 - Hub UI: Site erscheint nach dem ersten Snapshot als online.
 - Wake: Remote-Auftrag endet mit `sent`, `failed` oder `unknown`; bei `unknown` erst den Standort und das Gerät prüfen, bevor du erneut startest.
 
-Die aktuelle MVP-Variante nutzt HTTPS-Polling in Fünf-Sekunden-Intervallen. Sie implementiert weder WSS noch ein integriertes Terminal. Die Grenzen und geplanten Erweiterungen stehen in [RFC 0002](rfcs/0002-standorte-und-connect.md) und [RFC 0003](rfcs/0003-web-mobile-ssh.md).
+Die aktuelle MVP-Variante nutzt HTTPS-Polling in Fünf-Sekunden-Intervallen für WOL Connect. Das optionale integrierte Terminal nutzt authentifiziertes WSS und einen lokalen `tailscale ssh`-Prozess am Hub. Die Webanmeldung ist kein Tailnet-Identitätsmapping. Die Grenzen und Designgründe stehen in [RFC 0002](rfcs/0002-standorte-und-connect.md) und [RFC 0003](rfcs/0003-web-mobile-ssh.md).

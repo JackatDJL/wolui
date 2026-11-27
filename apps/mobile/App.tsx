@@ -24,6 +24,8 @@ type Device = {
   mac: string
   network_profile_id: string
   tailscale_name: string | null
+  ssh_enabled: boolean
+  ssh_username: string | null
   revision: number
 }
 type WakeJob = { id: string; status: string }

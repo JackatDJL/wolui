@@ -21,6 +21,8 @@ services:
       WOLUI_CONNECT_URL: ${WOLUI_CONNECT_URL:-}
       WOLUI_CONNECT_INVITATION_FILE: ${WOLUI_CONNECT_INVITATION_FILE:-/data/connect-invitation}
       WOLUI_CONNECT_TOKEN_FILE: /data/connect-token
+      WOLUI_SSH_ENABLED: ${WOLUI_SSH_ENABLED:-false}
+      WOLUI_TAILSCALE_SOCKET: ${WOLUI_TAILSCALE_SOCKET:-/var/run/tailscale/tailscaled.sock}
     volumes:
       - ./data:/data
       - ./secrets/access-token:/run/secrets/wolui_access_token:ro

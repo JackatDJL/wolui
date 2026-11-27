@@ -73,6 +73,10 @@ pub struct Device {
     pub mac: String,
     pub network_profile_id: String,
     pub tailscale_name: Option<String>,
+    #[serde(default)]
+    pub ssh_enabled: bool,
+    #[serde(default)]
+    pub ssh_username: Option<String>,
     pub revision: i64,
 }
 

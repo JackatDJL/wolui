@@ -16,6 +16,7 @@ WORKDIR /workspace
 COPY . .
 RUN cargo build --locked --release --package wol-server
 
+FROM tailscale/tailscale:stable AS tailscale-cli
 FROM debian:bookworm-slim AS runtime
 ENV WOLUI_ROLE=site \
     WOLUI_LISTEN=0.0.0.0:3000 \
@@ -32,6 +33,7 @@ RUN apt-get update \
     && install -d -o 10001 -g 10001 /data
 
 COPY --from=server-build --chown=0:0 /workspace/target/release/wol-server /usr/local/bin/wol-server
+COPY --from=tailscale-cli --chown=0:0 /usr/local/bin/tailscale /usr/local/bin/tailscale
 COPY --from=web-build --chown=0:0 /workspace/apps/web/dist /opt/wolui/web
 
 USER 10001:10001

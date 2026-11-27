@@ -22,10 +22,11 @@ ENV WOLUI_ROLE=site \
     WOLUI_LISTEN=0.0.0.0:3000 \
     WOLUI_DATA_DIR=/data \
     WOLUI_ACCESS_TOKEN_FILE=/run/secrets/wolui_access_token \
-    WOLUI_WEB_DIR=/opt/wolui/web
+    WOLUI_WEB_DIR=/opt/wolui/web \
+    XDG_CONFIG_HOME=/data/.config
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates curl \
+    && apt-get install --no-install-recommends -y ca-certificates curl openssh-client \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 wolui \
     && useradd --uid 10001 --gid wolui --no-create-home --home-dir /nonexistent \

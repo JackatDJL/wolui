@@ -37,7 +37,8 @@ sudo chown 10001:10001 deploy/data
 Der Token ist ein Installationsgeheimnis. Sicher verwahren und nicht in Git
 einchecken. Die Gruppe 10001 kann das Secret durchqueren und lesen. Das
 Datenverzeichnis muss für UID/GID 10001 schreibbar sein; `deploy/data` speichert
-unter anderem die SQLite-Datenbank dauerhaft.
+unter anderem die SQLite-Datenbank und Tailscale-SSH-Hostschlüssel unter
+`data/.config/tailscale` dauerhaft.
 
 ```sh
 docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --build

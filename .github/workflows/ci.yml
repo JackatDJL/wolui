@@ -76,6 +76,7 @@ jobs:
             docker logs "$container"
             exit 1
           fi
+          docker exec "$container" sh -c 'command -v ssh >/dev/null && command -v tailscale >/dev/null && test -d "$XDG_CONFIG_HOME"'
           curl --fail --silent --show-error "$url/" -o "$scratch/index.html"
           grep -Fq '<div id="root"></div>' "$scratch/index.html"
           jq -Rn --rawfile token "$scratch/token" '{token: ($token | rtrimstr("\n"))}' |

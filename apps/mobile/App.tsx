@@ -16,6 +16,13 @@ import * as SecureStore from 'expo-secure-store'
 
 type Credentials = { baseUrl: string; sessionToken: string; csrfToken: string }
 type ApiError = { code?: string; message?: string }
+
+class ApiRequestError extends Error {
+  constructor(message: string, readonly status: number, readonly code?: string) {
+    super(message)
+    this.name = 'ApiRequestError'
+  }
+}
 type Site = { id: string; name: string; local: boolean; online: boolean; last_seen_at: number | null }
 type Profile = { id: string; name: string }
 type Device = {
@@ -45,7 +52,7 @@ async function api<T>(credentials: Credentials, path: string, init: RequestInit 
   if (!response.ok) {
     let body: ApiError = {}
     try { body = await response.json() as ApiError } catch { /* response may have no JSON body */ }
-    throw new Error(body.message || 'Anfrage fehlgeschlagen (' + response.status + ')')
+    throw new ApiRequestError(body.message || 'Anfrage fehlgeschlagen (' + response.status + ')', response.status, body.code)
   }
   if (response.status === 204) return undefined as T
   return await response.json() as T
@@ -71,6 +78,7 @@ function App() {
   const [connecting, setConnecting] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
+  const [credentialDeleteFailed, setCredentialDeleteFailed] = useState(false)
   const [sites, setSites] = useState<Site[]>([])
   const [profiles, setProfiles] = useState<Profile[]>([])
   const [devices, setDevices] = useState<Device[]>([])
@@ -78,6 +86,7 @@ function App() {
   const [jobs, setJobs] = useState<Record<string, WakeJob>>({})
   const [waking, setWaking] = useState<string | null>(null)
   const refreshGeneration = useRef(0)
+  const scopeGeneration = useRef(0)
   const credentialsRef = useRef(credentials)
   const selectedSiteRef = useRef(selectedSite)
 
@@ -87,22 +96,43 @@ function App() {
 
   const clearSession = useCallback(async () => {
     refreshGeneration.current += 1
+    scopeGeneration.current += 1
     credentialsRef.current = null
     selectedSiteRef.current = ''
-    await SecureStore.deleteItemAsync(CREDENTIALS_KEY)
-    setCredentials(null)
-    setSelectedSite('')
-    setRefreshing(false)
-    setError('')
-    setSites([])
-    setProfiles([])
-    setDevices([])
-    setJobs({})
+    let deleteFailed = false
+    try {
+      await SecureStore.deleteItemAsync(CREDENTIALS_KEY)
+    } catch {
+      deleteFailed = true
+    } finally {
+      setCredentials(null)
+      setSelectedSite('')
+      setRefreshing(false)
+      setSites([])
+      setProfiles([])
+      setDevices([])
+      setJobs({})
+      setWaking(null)
+      setCredentialDeleteFailed(deleteFailed)
+      setError(deleteFailed ? 'Die gespeicherte Sitzung konnte nicht gelöscht werden. Bitte versuche es erneut.' : '')
+    }
+  }, [])
+
+  const retryCredentialDelete = useCallback(async () => {
+    try {
+      await SecureStore.deleteItemAsync(CREDENTIALS_KEY)
+      setCredentialDeleteFailed(false)
+      setError('')
+    } catch {
+      setCredentialDeleteFailed(true)
+      setError('Die gespeicherte Sitzung konnte nicht gelöscht werden. Bitte versuche es erneut.')
+    }
   }, [])
 
   const selectSite = useCallback((siteId: string) => {
     if (selectedSiteRef.current === siteId) return
     refreshGeneration.current += 1
+    scopeGeneration.current += 1
     selectedSiteRef.current = siteId
     setSelectedSite(siteId)
     setDevices([])
@@ -128,6 +158,7 @@ function App() {
       setSites(nextSites)
       const currentSite = nextSites.some(site => site.id === expectedSite) ? expectedSite : nextSites[0]?.id ?? ''
       if (currentSite !== expectedSite) {
+        scopeGeneration.current += 1
         selectedSiteRef.current = currentSite
         expectedSite = currentSite
       }
@@ -149,7 +180,7 @@ function App() {
       if (!isCurrent()) return
       const message = caught instanceof Error ? caught.message : 'Die Verbindung zum Server ist fehlgeschlagen.'
       setError(message)
-      if (/session|authentifiz|unauthorized/i.test(message)) await clearSession()
+      if (caught instanceof ApiRequestError && caught.status === 401) await clearSession()
     } finally {
       if (isCurrent()) setRefreshing(false)
     }
@@ -237,7 +268,9 @@ function App() {
       }
       const next: Credentials = { baseUrl: origin, sessionToken: result.session_token, csrfToken: result.csrf_token }
       await SecureStore.setItemAsync(CREDENTIALS_KEY, JSON.stringify(next))
+      setCredentialDeleteFailed(false)
       refreshGeneration.current += 1
+      scopeGeneration.current += 1
       credentialsRef.current = next
       selectedSiteRef.current = ''
       setBaseUrl(origin)
@@ -253,19 +286,26 @@ function App() {
 
   async function wakeDevice(device: Device) {
     if (!credentials || !selectedSite) return
+    const auth = credentials
+    const siteId = selectedSite
+    const scope = scopeGeneration.current
+    const isCurrent = () => scopeGeneration.current === scope
+      && credentialsRef.current?.baseUrl === auth.baseUrl
+      && credentialsRef.current?.sessionToken === auth.sessionToken
+      && selectedSiteRef.current === siteId
     setWaking(device.id)
     setError('')
     try {
-      const job = await api<WakeJob>(credentials, '/api/v1/sites/' + encodeURIComponent(selectedSite) + '/devices/' + encodeURIComponent(device.id) + '/wake', {
+      const job = await api<WakeJob>(auth, '/api/v1/sites/' + encodeURIComponent(siteId) + '/devices/' + encodeURIComponent(device.id) + '/wake', {
         method: 'POST',
         headers: { 'Idempotency-Key': Date.now() + '-' + Math.random().toString(36).slice(2) },
         body: JSON.stringify({}),
       })
-      setJobs(current => ({ ...current, [device.id]: job }))
+      if (isCurrent()) setJobs(current => ({ ...current, [device.id]: job }))
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Das Startsignal konnte nicht gesendet werden.')
+      if (isCurrent()) setError(caught instanceof Error ? caught.message : 'Das Startsignal konnte nicht gesendet werden.')
     } finally {
-      setWaking(null)
+      if (isCurrent()) setWaking(current => current === device.id ? null : current)
     }
   }
 
@@ -291,6 +331,7 @@ function App() {
         <Text style={styles.label}>Zugangstoken</Text>
         <TextInput autoCapitalize="none" autoCorrect={false} placeholder="Token aus deiner Server-Konfiguration" value={accessToken} onChangeText={setAccessToken} style={styles.input} secureTextEntry textContentType="password" />
         {error ? <Text style={styles.error}>{error}</Text> : null}
+        {credentialDeleteFailed ? <Pressable onPress={() => void retryCredentialDelete()}><Text style={styles.retry}>Gespeicherte Sitzung erneut löschen</Text></Pressable> : null}
         <Pressable onPress={() => void signIn()} disabled={connecting || !accessToken.trim() || !baseUrl.trim()} style={({ pressed }) => [styles.primaryButton, (pressed || connecting) && styles.buttonPressed, (!accessToken.trim() || !baseUrl.trim()) && styles.disabledButton]}>
           {connecting ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryButtonText}>Sicher verbinden  →</Text>}
         </Pressable>

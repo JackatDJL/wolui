@@ -4,7 +4,7 @@ WOL Connect verbindet einen Hub mit lokalen Standortinstanzen. Der Hub braucht e
 
 ## Browser-Terminal über Tailscale SSH
 
-Der Hub kann ein Terminal im Browser öffnen und `tailscale ssh` als Gateway-Client ausführen. Das gilt für lokale und verbundene Geräte, deren Tailscale-Name aus dem Standortinventar bekannt ist. Dafür muss der Hub den Tailscale-CLI-Prozess und dessen `tailscaled`-Socket erreichen können. Das Image enthält den CLI-Client; der Tailscale-Daemon und seine Socket-Freigabe werden separat betrieben.
+Der Hub kann ein Terminal im Browser öffnen und `tailscale ssh` als Gateway-Client ausführen. Das gilt für lokale und verbundene Geräte, deren Tailscale-Name aus dem Standortinventar bekannt ist. Dafür muss der Hub den Tailscale-CLI-Prozess und dessen `tailscaled`-Socket erreichen können. Das Image enthält Tailscale CLI und den dafür benötigten OpenSSH-Client; der Tailscale-Daemon und seine Socket-Freigabe werden separat betrieben. Der Hub legt Tailscales geprüfte SSH-Hostschlüssel im persistenten `/data/.config/tailscale` ab.
 
 Aktiviere den Gateway auf dem Hub:
 

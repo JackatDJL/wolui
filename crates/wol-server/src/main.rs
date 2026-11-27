@@ -29,7 +29,7 @@ use std::{
 use subtle::ConstantTimeEq;
 use tokio::{
     sync::Semaphore,
-    time::{sleep, Duration},
+    time::{sleep, timeout, Duration},
 };
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -41,6 +41,7 @@ use wol_core::{Device, MacAddress};
 const SESSION_COOKIE: &str = "wolui_session";
 const SESSION_SECONDS: i64 = 12 * 60 * 60;
 const MAX_PROFILE_NAME_BYTES: usize = 256;
+const MAX_PROFILE_ID_BYTES: usize = 4096;
 const MAX_CONNECT_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Serialize)]
@@ -61,6 +62,7 @@ struct AppState {
     ssh_gateway_enabled: bool,
     tailscale_bin: String,
     tailscale_socket: String,
+    tailscale_config_dir: PathBuf,
     ssh_sessions: Arc<Semaphore>,
 }
 
@@ -132,10 +134,43 @@ struct DevicePatch {
     name: Option<String>,
     mac: Option<String>,
     network_profile_id: Option<String>,
-    tailscale_name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_patch_nullable")]
+    tailscale_name: PatchNullable<String>,
     ssh_enabled: Option<bool>,
-    ssh_username: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_patch_nullable")]
+    ssh_username: PatchNullable<String>,
     revision: i64,
+}
+
+enum PatchNullable<T> {
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<T> Default for PatchNullable<T> {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+fn deserialize_patch_nullable<'de, D, T>(deserializer: D) -> Result<PatchNullable<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(|value| match value {
+        Some(value) => PatchNullable::Value(value),
+        None => PatchNullable::Null,
+    })
+}
+
+fn apply_patch_nullable<T>(patch: PatchNullable<T>, current: Option<T>) -> Option<T> {
+    match patch {
+        PatchNullable::Missing => current,
+        PatchNullable::Null => None,
+        PatchNullable::Value(value) => Some(value),
+    }
 }
 #[derive(Deserialize, Serialize)]
 struct WakeOutput {
@@ -602,7 +637,7 @@ async fn connect_snapshot(
         input.profiles.iter().map(|p| p.id.as_str()).collect();
     for profile in &input.profiles {
         if profile.id.is_empty()
-            || profile.id.len() > 80
+            || profile.id.len() > MAX_PROFILE_ID_BYTES
             || profile.name.trim().is_empty()
             || profile.name.len() > MAX_PROFILE_NAME_BYTES
         {
@@ -703,12 +738,22 @@ async fn connect_snapshot(
         .bind(&token_digest)
         .execute(&mut *tx)
         .await;
-    if !matches!(heartbeat, Ok(ref result) if result.rows_affected() == 1) {
-        return error(
-            StatusCode::UNAUTHORIZED,
-            "connect_unauthorized",
-            "Connect credential is invalid or revoked",
-        );
+    match heartbeat {
+        Ok(result) if result.rows_affected() == 1 => {}
+        Ok(_) => {
+            return error(
+                StatusCode::UNAUTHORIZED,
+                "connect_unauthorized",
+                "Connect credential is invalid or revoked",
+            )
+        }
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Could not update site heartbeat",
+            )
+        }
     }
     if tx.commit().await.is_err() {
         return error(
@@ -1058,13 +1103,14 @@ fn valid_ssh_username(value: &str) -> bool {
 }
 
 fn valid_ssh_host(value: &str) -> bool {
-    if value.is_empty() || value.len() > 253 || value.starts_with('-') {
+    let hostname = value.strip_suffix('.').unwrap_or(value);
+    if hostname.is_empty() || hostname.len() > 253 || hostname.starts_with('-') {
         return false;
     }
-    if value.parse::<std::net::IpAddr>().is_ok() {
+    if hostname.parse::<std::net::IpAddr>().is_ok() {
         return true;
     }
-    value.split('.').all(|label| {
+    hostname.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
             && !label.starts_with('-')
@@ -1187,9 +1233,9 @@ async fn update_device(
         name: input.name.unwrap_or(old.name),
         mac: input.mac.unwrap_or(old.mac),
         network_profile_id: input.network_profile_id.unwrap_or(old.network_profile_id),
-        tailscale_name: input.tailscale_name.unwrap_or(old.tailscale_name),
+        tailscale_name: apply_patch_nullable(input.tailscale_name, old.tailscale_name),
         ssh_enabled: input.ssh_enabled.unwrap_or(old.ssh_enabled),
-        ssh_username: input.ssh_username.unwrap_or(old.ssh_username),
+        ssh_username: apply_patch_nullable(input.ssh_username, old.ssh_username),
     };
     if let Err((code, msg)) = validate_input(&candidate) {
         return error(StatusCode::UNPROCESSABLE_ENTITY, code, msg);
@@ -1294,8 +1340,8 @@ async fn wake(
         );
     };
     if site != state.site_id {
-        if let Some((job, status, device_id)) = match sqlx::query_as::<_, (String, String, String)>(
-            "SELECT id,status,device_id FROM connect_commands WHERE site_id=? AND idempotency_key=?",
+        if let Some((job, status, device_id, expires_at)) = match sqlx::query_as::<_, (String, String, String, i64)>(
+            "SELECT id,status,device_id,expires_at FROM connect_commands WHERE site_id=? AND idempotency_key=?",
         )
         .bind(&site)
         .bind(key)
@@ -1314,6 +1360,10 @@ async fn wake(
             if device_id != id {
                 return error(StatusCode::CONFLICT,"idempotency_conflict","This Idempotency-Key was used for a different operation");
             }
+            let status = if expires_at <= now() {
+                let _ = sqlx::query("UPDATE connect_commands SET status='unknown' WHERE id=? AND status IN ('queued','accepted') AND expires_at<=?").bind(&job).bind(now()).execute(&state.db).await;
+                if matches!(status.as_str(), "queued" | "accepted") { "unknown".to_owned() } else { status }
+            } else { status };
             return (StatusCode::ACCEPTED,Json(WakeOutput{id:job,status})).into_response();
         }
         let remote = sqlx::query_as::<_, (Option<i64>,)>(
@@ -1361,8 +1411,12 @@ async fn wake(
         match sqlx::query("INSERT INTO connect_commands(id,site_id,device_id,idempotency_key,status,expires_at,created_at) VALUES(?,?,?,?,'queued',?,?)")
             .bind(&job).bind(&site).bind(&id).bind(key).bind(now()+30).bind(now()).execute(&state.db).await {
             Ok(_) => return (StatusCode::ACCEPTED,Json(WakeOutput{id:job,status:"queued".into()})).into_response(),
-            Err(_) => if let Ok(Some((existing,status,device_id))) = sqlx::query_as::<_,(String,String,String)>("SELECT id,status,device_id FROM connect_commands WHERE site_id=? AND idempotency_key=?").bind(&site).bind(key).fetch_optional(&state.db).await {
+            Err(_) => if let Ok(Some((existing,status,device_id,expires_at))) = sqlx::query_as::<_,(String,String,String,i64)>("SELECT id,status,device_id,expires_at FROM connect_commands WHERE site_id=? AND idempotency_key=?").bind(&site).bind(key).fetch_optional(&state.db).await {
                 if device_id != id { return error(StatusCode::CONFLICT,"idempotency_conflict","This Idempotency-Key was used for a different operation"); }
+                let status = if expires_at <= now() && matches!(status.as_str(), "queued" | "accepted") {
+                    let _ = sqlx::query("UPDATE connect_commands SET status='unknown' WHERE id=? AND status IN ('queued','accepted') AND expires_at<=?").bind(&existing).bind(now()).execute(&state.db).await;
+                    "unknown".to_owned()
+                } else { status };
                 return (StatusCode::ACCEPTED,Json(WakeOutput{id:existing,status})).into_response();
             } else { return error(StatusCode::CONFLICT,"idempotency_conflict","Could not reserve remote wake request"); }
         }
@@ -1523,23 +1577,23 @@ async fn ssh_terminal(
         }
     };
     let target = if site == state.site_id {
-        sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            "SELECT tailscale_name,ssh_username FROM devices WHERE id=? AND ssh_enabled=1",
+        sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+            "SELECT tailscale_name,ssh_username,NULL FROM devices WHERE id=? AND ssh_enabled=1",
         )
         .bind(&device)
         .fetch_optional(&state.db)
         .await
     } else {
-        sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            "SELECT d.tailscale_name,d.ssh_username FROM remote_devices d JOIN connect_sites s ON s.id=d.site_id WHERE d.site_id=? AND d.id=? AND d.ssh_enabled=1 AND s.active=1",
+        sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+            "SELECT d.tailscale_name,d.ssh_username,s.token_digest FROM remote_devices d JOIN connect_sites s ON s.id=d.site_id WHERE d.site_id=? AND d.id=? AND d.ssh_enabled=1 AND s.active=1",
         )
         .bind(&site)
         .bind(&device)
         .fetch_optional(&state.db)
         .await
     };
-    let (host, username) = match target {
-        Ok(Some((Some(host), Some(username)))) => (host, username),
+    let (host, username, pairing_digest) = match target {
+        Ok(Some((Some(host), Some(username), pairing_digest))) => (host, username, pairing_digest),
         Ok(_) => {
             return error(
                 StatusCode::NOT_FOUND,
@@ -1573,6 +1627,7 @@ async fn ssh_terminal(
                 permit,
                 session_id,
                 session_digest,
+                pairing_digest,
                 site,
                 device,
                 username,
@@ -1587,6 +1642,7 @@ async fn run_ssh_terminal(
     _permit: tokio::sync::OwnedSemaphorePermit,
     session_id: String,
     session_digest: String,
+    pairing_digest: Option<String>,
     site_id: String,
     device_id: String,
     username: String,
@@ -1596,7 +1652,7 @@ async fn run_ssh_terminal(
     if sqlx::query("INSERT INTO ssh_sessions(id,site_id,device_id,started_at,outcome) VALUES(?,?,?,?, 'opening')")
         .bind(&session_id).bind(&site_id).bind(&device_id).bind(started_at)
         .execute(&state.db).await.is_err() {
-        let _ = socket.send(Message::Text(serde_json::json!({"type":"error","message":"Could not record SSH session metadata"}).to_string())).await;
+        let _ = send_ssh_message(&mut socket, Message::Text(serde_json::json!({"type":"error","message":"Could not record SSH session metadata"}).to_string())).await;
         return;
     }
 
@@ -1610,7 +1666,7 @@ async fn run_ssh_terminal(
         Ok(pair) => pair,
         Err(err) => {
             tracing::warn!(%err, "could not create SSH terminal PTY");
-            let _ = socket.send(Message::Text(serde_json::json!({"type":"error","message":"The terminal could not be opened on this server"}).to_string())).await;
+            let _ = send_ssh_message(&mut socket, Message::Text(serde_json::json!({"type":"error","message":"The terminal could not be opened on this server"}).to_string())).await;
             finish_ssh_session(&state, &session_id, "start_failed").await;
             return;
         }
@@ -1620,11 +1676,12 @@ async fn run_ssh_terminal(
     command.arg("ssh");
     command.arg(format!("{username}@{host}"));
     command.env("TERM", "xterm-256color");
+    command.env("XDG_CONFIG_HOME", &state.tailscale_config_dir);
     let mut child = match pair.slave.spawn_command(command) {
         Ok(child) => child,
         Err(err) => {
             tracing::warn!(%err, "could not start Tailscale SSH client");
-            let _ = socket.send(Message::Text(serde_json::json!({"type":"error","message":"Tailscale SSH could not start. Check the CLI and local Tailscale connection."}).to_string())).await;
+            let _ = send_ssh_message(&mut socket, Message::Text(serde_json::json!({"type":"error","message":"Tailscale SSH could not start. Check the CLI and local Tailscale connection."}).to_string())).await;
             finish_ssh_session(&state, &session_id, "start_failed").await;
             return;
         }
@@ -1664,7 +1721,7 @@ async fn run_ssh_terminal(
             }
         }
     });
-    let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+    let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(32);
     thread::spawn(move || {
         let mut writer = writer;
         while let Ok(bytes) = input_rx.recv() {
@@ -1674,12 +1731,13 @@ async fn run_ssh_terminal(
         }
     });
 
-    if socket
-        .send(Message::Text(
+    if !send_ssh_message(
+        &mut socket,
+        Message::Text(
             serde_json::json!({"type":"ready","session_id":session_id.clone()}).to_string(),
-        ))
-        .await
-        .is_err()
+        ),
+    )
+    .await
     {
         let _ = child.kill();
         let _ = child.wait();
@@ -1694,14 +1752,18 @@ async fn run_ssh_terminal(
             output = output_rx.recv() => match output {
                 Some(bytes) => {
                     idle_deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(15 * 60));
-                    if socket.send(Message::Binary(bytes.into())).await.is_err() { break "disconnected"; }
+                    if !send_ssh_message(&mut socket, Message::Binary(bytes.into())).await { break "disconnected"; }
                 },
                 None => break "closed",
             },
             message = socket.recv() => match message {
                 Some(Ok(Message::Binary(bytes))) => {
                     idle_deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(15 * 60));
-                    if input_tx.send(bytes.to_vec()).is_err() { break "closed"; }
+                    match input_tx.try_send(bytes.to_vec()) {
+                        Ok(()) => {}
+                        Err(mpsc::TrySendError::Full(_)) => break "input_overflow",
+                        Err(mpsc::TrySendError::Disconnected(_)) => break "closed",
+                    }
                 },
                 Some(Ok(Message::Text(text))) => {
                     if let Ok(resize) = serde_json::from_str::<TerminalResize>(&text) {
@@ -1716,16 +1778,16 @@ async fn run_ssh_terminal(
                         }
                     }
                 },
-                Some(Ok(Message::Ping(payload))) => { if socket.send(Message::Pong(payload)).await.is_err() { break "disconnected"; } },
+                Some(Ok(Message::Ping(payload))) => { if !send_ssh_message(&mut socket, Message::Pong(payload)).await { break "disconnected"; } },
                 Some(Ok(Message::Pong(_))) => {},
                 Some(Ok(Message::Close(_))) | None => break "disconnected",
                 Some(Err(_)) => break "disconnected",
             },
             _ = authorization_check.tick() => {
-                match ssh_authorization_is_current(&state, &session_digest, &site_id, &device_id, &username, &host).await {
+                match ssh_authorization_is_current(&state, &session_digest, pairing_digest.as_deref(), &site_id, &device_id, &username, &host).await {
                     Ok(true) => {},
                     Ok(false) => {
-                        let _ = socket.send(Message::Text(serde_json::json!({"type":"error","message":"SSH access or the web session was revoked"}).to_string())).await;
+                        let _ = send_ssh_message(&mut socket, Message::Text(serde_json::json!({"type":"error","message":"SSH access or the web session was revoked"}).to_string())).await;
                         break "revoked";
                     },
                     Err(err) => {
@@ -1735,7 +1797,7 @@ async fn run_ssh_terminal(
                 }
             }
             _ = &mut idle_deadline => {
-                let _ = socket.send(Message::Text(serde_json::json!({"type":"error","message":"SSH session closed after 15 minutes without terminal activity"}).to_string())).await;
+                let _ = send_ssh_message(&mut socket, Message::Text(serde_json::json!({"type":"error","message":"SSH session closed after 15 minutes without terminal activity"}).to_string())).await;
                 break "idle_timeout";
             }
         }
@@ -1746,9 +1808,17 @@ async fn run_ssh_terminal(
     finish_ssh_session(&state, &session_id, outcome).await;
 }
 
+async fn send_ssh_message(socket: &mut WebSocket, message: Message) -> bool {
+    matches!(
+        timeout(Duration::from_secs(5), socket.send(message)).await,
+        Ok(Ok(()))
+    )
+}
+
 async fn ssh_authorization_is_current(
     state: &AppState,
     session_digest: &str,
+    pairing_digest: Option<&str>,
     site_id: &str,
     device_id: &str,
     username: &str,
@@ -1776,13 +1846,17 @@ async fn ssh_authorization_is_current(
         .await?
             == 1
     } else {
+        let Some(pairing_digest) = pairing_digest else {
+            return Ok(false);
+        };
         sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(SELECT 1 FROM remote_devices d JOIN connect_sites s ON s.id=d.site_id WHERE d.site_id=? AND d.id=? AND d.ssh_enabled=1 AND d.tailscale_name=? AND d.ssh_username=? AND s.active=1)",
+            "SELECT EXISTS(SELECT 1 FROM remote_devices d JOIN connect_sites s ON s.id=d.site_id WHERE d.site_id=? AND d.id=? AND d.ssh_enabled=1 AND d.tailscale_name=? AND d.ssh_username=? AND s.active=1 AND s.token_digest=?)",
         )
         .bind(site_id)
         .bind(device_id)
         .bind(host)
         .bind(username)
+        .bind(pairing_digest)
         .fetch_one(&state.db)
         .await?
             == 1
@@ -1810,15 +1884,30 @@ fn send_magic_packet(
     socket.send_to(&mac.magic_packet(), SocketAddr::from((broadcast, port)))
 }
 
-async fn local_snapshot(state: &AppState) -> Result<SnapshotInput, sqlx::Error> {
+async fn local_snapshot(state: &AppState) -> Result<SnapshotInput, String> {
     let profiles =
         sqlx::query_as::<_, (String, String)>("SELECT id,name FROM network_profiles ORDER BY name")
             .fetch_all(&state.db)
-            .await?
+            .await
+            .map_err(|err| err.to_string())?
             .into_iter()
             .map(|(id, name)| SnapshotProfile { id, name })
-            .collect();
-    let devices = sqlx::query_as::<_,(String,String,String,String,String,Option<String>,bool,Option<String>,i64)>("SELECT d.id,d.name,d.mac,d.network_profile_id,p.name,d.tailscale_name,d.ssh_enabled,d.ssh_username,d.revision FROM devices d JOIN network_profiles p ON p.id=d.network_profile_id ORDER BY d.name").fetch_all(&state.db).await?
+            .collect::<Vec<_>>();
+    for profile in &profiles {
+        if profile.id.is_empty() || profile.id.len() > MAX_PROFILE_ID_BYTES {
+            return Err(format!(
+                "Network profile {:?} has an ID longer than the WOL Connect limit of {} bytes; shorten the profile ID in this site's configuration",
+                profile.name, MAX_PROFILE_ID_BYTES
+            ));
+        }
+        if profile.name.trim().is_empty() || profile.name.len() > MAX_PROFILE_NAME_BYTES {
+            return Err(format!(
+                "Network profile {:?} has a name outside the WOL Connect limit of 1 to {} bytes; shorten the profile name in this site's configuration",
+                profile.id, MAX_PROFILE_NAME_BYTES
+            ));
+        }
+    }
+    let devices = sqlx::query_as::<_,(String,String,String,String,String,Option<String>,bool,Option<String>,i64)>("SELECT d.id,d.name,d.mac,d.network_profile_id,p.name,d.tailscale_name,d.ssh_enabled,d.ssh_username,d.revision FROM devices d JOIN network_profiles p ON p.id=d.network_profile_id ORDER BY d.name").fetch_all(&state.db).await.map_err(|err| err.to_string())?
         .into_iter().map(|(id,name,mac,network_profile_id,network_profile_name,tailscale_name,ssh_enabled,ssh_username,revision)|SnapshotDevice{id,name,mac,network_profile_id,network_profile_name,tailscale_name,ssh_enabled,ssh_username,revision}).collect();
     Ok(SnapshotInput {
         site_name: state.site_name.clone(),
@@ -2204,6 +2293,7 @@ mod tests {
                 ssh_gateway_enabled: false,
                 tailscale_bin: "tailscale".into(),
                 tailscale_socket: "/var/run/tailscale/tailscaled.sock".into(),
+                tailscale_config_dir: PathBuf::from("/tmp/wolui-test-config"),
                 ssh_sessions: Arc::new(Semaphore::new(4)),
             },
             receiver,
@@ -2380,6 +2470,41 @@ mod tests {
         assert!(check_ssh_origin(&state, &correct).is_ok());
     }
 
+    #[test]
+    fn device_patch_distinguishes_omitted_null_and_string_values() {
+        let missing: DevicePatch = serde_json::from_str(r#"{"revision":1}"#).unwrap();
+        assert!(matches!(missing.ssh_username, PatchNullable::Missing));
+        let cleared: DevicePatch =
+            serde_json::from_str(r#"{"revision":1,"ssh_username":null}"#).unwrap();
+        assert!(matches!(cleared.ssh_username, PatchNullable::Null));
+        let set: DevicePatch =
+            serde_json::from_str(r#"{"revision":1,"ssh_username":"jack"}"#).unwrap();
+        assert!(matches!(set.ssh_username, PatchNullable::Value(value) if value == "jack"));
+    }
+
+    #[tokio::test]
+    async fn local_snapshot_preserves_long_legacy_profile_ids_and_reports_wire_limit() {
+        let (state, _receiver) = test_state().await;
+        let legacy_id = "x".repeat(81);
+        sqlx::query("INSERT INTO network_profiles(id,name,interface,bind_address,broadcast_address,port) VALUES(?, 'Legacy profile', 'lo', '127.0.0.1', '127.0.0.1', 9)")
+            .bind(&legacy_id).execute(&state.db).await.unwrap();
+        assert!(local_snapshot(&state)
+            .await
+            .unwrap()
+            .profiles
+            .iter()
+            .any(|profile| profile.id == legacy_id));
+        let too_long_id = "y".repeat(MAX_PROFILE_ID_BYTES + 1);
+        sqlx::query("INSERT INTO network_profiles(id,name,interface,bind_address,broadcast_address,port) VALUES(?, 'Oversize profile', 'lo', '127.0.0.1', '127.0.0.1', 9)")
+            .bind(too_long_id).execute(&state.db).await.unwrap();
+        let err = match local_snapshot(&state).await {
+            Ok(_) => panic!("over-limit profile ID should be rejected for Connect export"),
+            Err(err) => err,
+        };
+        assert!(err.contains("Oversize profile"));
+        assert!(err.contains("shorten the profile ID"));
+    }
+
     #[tokio::test]
     async fn ssh_authorization_recheck_observes_session_and_device_revocation() {
         let (state, _receiver) = test_state().await;
@@ -2399,6 +2524,7 @@ mod tests {
         assert!(ssh_authorization_is_current(
             &state,
             &token_digest,
+            None,
             "local",
             "device-1",
             "jack",
@@ -2414,6 +2540,7 @@ mod tests {
         assert!(!ssh_authorization_is_current(
             &state,
             &token_digest,
+            None,
             "local",
             "device-1",
             "jack",
@@ -2434,6 +2561,7 @@ mod tests {
         assert!(!ssh_authorization_is_current(
             &state,
             &token_digest,
+            None,
             "local",
             "device-1",
             "jack",
@@ -2446,11 +2574,59 @@ mod tests {
     #[test]
     fn ssh_target_validation_rejects_command_like_values() {
         assert!(valid_ssh_host("pc.home.ts.net"));
+        assert!(valid_ssh_host("pc.home.ts.net."));
+        assert!(!valid_ssh_host("pc..home.ts.net."));
         assert!(valid_ssh_host("100.64.2.5"));
         assert!(!valid_ssh_host("--help"));
         assert!(!valid_ssh_host("pc;touch /tmp/pwned"));
         assert!(valid_ssh_username("jack.doe_1"));
         assert!(!valid_ssh_username("jack@example.com"));
+    }
+
+    #[tokio::test]
+    async fn remote_ssh_session_is_revoked_when_site_is_repaired() {
+        let (state, _receiver) = test_state().await;
+        let token_digest = hex::encode(digest("active-session"));
+        sqlx::query(
+            "INSERT INTO sessions(token_digest,csrf_token,created_at,expires_at) VALUES(?,?,?,?)",
+        )
+        .bind(&token_digest)
+        .bind("csrf")
+        .bind(now())
+        .bind(now() + 300)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO connect_sites(id,name,token_digest,is_local,active,created_at) VALUES('remote','Remote site','pairing-a',0,1,?)")
+            .bind(now()).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO remote_devices(site_id,id,name,mac,network_profile_id,network_profile_name,tailscale_name,revision,ssh_enabled,ssh_username) VALUES('remote','device-1','PC','02:23:45:67:89:ab','test','Test network','pc.home.ts.net',1,1,'jack')")
+            .execute(&state.db).await.unwrap();
+        assert!(ssh_authorization_is_current(
+            &state,
+            &token_digest,
+            Some("pairing-a"),
+            "remote",
+            "device-1",
+            "jack",
+            "pc.home.ts.net"
+        )
+        .await
+        .unwrap());
+        sqlx::query("UPDATE connect_sites SET token_digest='pairing-b' WHERE id='remote'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert!(!ssh_authorization_is_current(
+            &state,
+            &token_digest,
+            Some("pairing-a"),
+            "remote",
+            "device-1",
+            "jack",
+            "pc.home.ts.net"
+        )
+        .await
+        .unwrap());
     }
 
     #[tokio::test]
@@ -3004,13 +3180,10 @@ async fn load_profiles(db: &SqlitePool) -> Result<(), Box<dyn std::error::Error>
         for p in profiles {
             if p.id.trim().is_empty()
                 || p.name.trim().is_empty()
-                || p.name.len() > MAX_PROFILE_NAME_BYTES
                 || p.interface.trim().is_empty()
                 || p.port == 0
             {
-                return Err(
-                    "invalid WOLUI_NETWORK_PROFILES entry (name must be 1 to 256 bytes)".into(),
-                );
+                return Err("invalid WOLUI_NETWORK_PROFILES entry (id, name, interface, and port are required)".into());
             }
             sqlx::query("INSERT INTO network_profiles(id,name,interface,bind_address,broadcast_address,port) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,interface=excluded.interface,bind_address=excluded.bind_address,broadcast_address=excluded.broadcast_address,port=excluded.port")
                 .bind(p.id).bind(p.name).bind(p.interface).bind(p.bind_address.to_string()).bind(p.broadcast_address.to_string()).bind(p.port).execute(db).await?;
@@ -3047,6 +3220,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("setup token must have at least 32 bytes of entropy".into());
     }
     let data = env::var("WOLUI_DATA_DIR").unwrap_or_else(|_| "/data".into());
+    let tailscale_config_dir = env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(&data).join(".config"));
+    tokio::fs::create_dir_all(&tailscale_config_dir).await?;
+    #[cfg(unix)]
+    tokio::fs::set_permissions(
+        &tailscale_config_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .await?;
     let db = db_pool(&data).await?;
     let token_digest = hex::encode(digest(access_token));
     let previous = sqlx::query_scalar::<_, String>(
@@ -3102,6 +3285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "/usr/local/bin/tailscale".into()),
         tailscale_socket: env::var("WOLUI_TAILSCALE_SOCKET")
             .unwrap_or_else(|_| "/var/run/tailscale/tailscaled.sock".into()),
+        tailscale_config_dir,
         ssh_sessions: Arc::new(Semaphore::new(4)),
     };
     if let Some(connect_url) = env::var("WOLUI_CONNECT_URL")

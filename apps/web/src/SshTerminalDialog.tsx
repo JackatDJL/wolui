@@ -49,7 +49,11 @@ export default function SshTerminalDialog({ siteId, device, onClose }: { siteId:
     window.addEventListener('resize', sendResize)
 
     const dataSubscription = terminal.onData(data => {
-      if (authorized && socket.readyState === WebSocket.OPEN) socket.send(new TextEncoder().encode(data))
+      if (!authorized || socket.readyState !== WebSocket.OPEN) return
+      const bytes = new TextEncoder().encode(data)
+      for (let offset = 0; offset < bytes.length; offset += 16 * 1024) {
+        socket.send(bytes.subarray(offset, offset + 16 * 1024))
+      }
     })
 
     socket.onmessage = event => {
@@ -95,6 +99,9 @@ export default function SshTerminalDialog({ siteId, device, onClose }: { siteId:
 
     return () => {
       authorized = false
+      socket.onmessage = null
+      socket.onerror = null
+      socket.onclose = null
       observer.disconnect()
       window.removeEventListener('resize', sendResize)
       dataSubscription.dispose()

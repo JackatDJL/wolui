@@ -4,7 +4,7 @@
 
 Created in [T3 Code](https://t3.codes).
 
-WOL UI ist als selbst gehostete Oberfläche für Wake-on-LAN über mehrere Standorte geplant.
+WOL UI ist eine selbst gehostete Oberfläche für Wake-on-LAN über mehrere Standorte.
 
 Der lokale Einstieg für Linux steht in der [Docker-Anleitung](deploy/README.md). Ein lokales Netzwerkprofil legt fest, über welche Host-IP und Broadcast-Adresse das Magic Packet gesendet wird.
 

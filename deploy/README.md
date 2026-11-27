@@ -37,7 +37,8 @@ sudo chown 10001:10001 deploy/data
 Der Token ist ein Installationsgeheimnis. Sicher verwahren und nicht in Git
 einchecken. Die Gruppe 10001 kann das Secret durchqueren und lesen. Das
 Datenverzeichnis muss für UID/GID 10001 schreibbar sein; `deploy/data` speichert
-unter anderem die SQLite-Datenbank dauerhaft.
+unter anderem die SQLite-Datenbank und Tailscale-SSH-Hostschlüssel unter
+`data/.config/tailscale` dauerhaft.
 
 ```sh
 docker compose --env-file deploy/.env -f deploy/compose.yaml up -d --build
@@ -46,8 +47,11 @@ docker compose -f deploy/compose.yaml logs -f wolui
 ```
 
 Die Oberfläche ist über `http://localhost:3000` auf dem Docker-Host erreichbar.
-Das Beispiel nutzt den expliziten lokalen Entwicklungsmodus. Der Betrieb über
-HTTPS mit Reverse Proxy und der Hub-Betrieb folgen den Ausbaustufen im RFC 0004.
+Das Beispiel nutzt den expliziten lokalen Entwicklungsmodus. Für eine öffentliche
+Hub-Instanz und weitere Docker- oder Dokploy-Standorte lies die
+[WOL-Connect-Betriebsanleitung](../docs/connect-betrieb.md). Das Image startet
+standardmäßig ohne `--allow-loopback-dev`; setze bei einer öffentlichen Instanz
+`WOLUI_LISTEN=0.0.0.0:3000` und TLS am Reverse Proxy.
 
 Der Container läuft als UID/GID 10001, mit schreibgeschütztem Root-Dateisystem,
 ohne zusätzliche Linux-Capabilities und mit `no-new-privileges`. Schreibzugriff
@@ -85,5 +89,5 @@ die ausgelieferte Oberfläche und die Anmeldung. Nach einem erfolgreichen
 Build auf `main` schiebt der Workflow das getestete Image als
 `ghcr.io/jackatdjl/wolui:sha-<commit>` und `ghcr.io/jackatdjl/wolui:latest`
 in die GitHub Container Registry.
-Das Compose-Beispiel baut lokal aus dem Checkout. Hub-Betrieb und ARM64-Images
-sind weitere Meilensteine.
+Das Compose-Beispiel baut lokal aus dem Checkout. ARM64-Images sind ein weiterer
+Meilenstein.

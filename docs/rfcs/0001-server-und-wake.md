@@ -1,6 +1,6 @@
 # RFC 0001 – Server, Wake-on-LAN und Geräte
 
-Status: Entwurf
+Status: MVP implementiert; API-Vertragshärtung und Hardware-Abnahme offen.
 
 ## Ziel
 
@@ -12,10 +12,10 @@ Ein Linux-Rechner stellt Weboberfläche und API bereit, speichert Geräte dauerh
 | --- | --- |
 | `crates/wol-core` | Geräte, Netzwerkprofile, Wake-Paket, Zustände und Validierung |
 | `crates/wol-server` | Tokio-Runtime, Axum-Routen, Socket-Ausführung, SQLite und eingebettete Web-Dateien |
-| `crates/wol-protocol` | Nachrichten und Versionierung der Standortkopplung |
+| `crates/wol-protocol` | Geplant: gemeinsame Nachrichten und Versionierung der Standortkopplung; derzeit liegen Connect-Typen im Server |
 | `apps/web` | React, TypeScript, Vite |
-| `apps/mobile` | Expo, React Native, Expo Router |
-| `packages/api-client` | Generierte HTTP-Typen, API-Aufrufe und gemeinsame Fehlerabbildung |
+| `apps/mobile` | Expo, React Native und Expo SecureStore; Expo Router ist derzeit nicht eingerichtet |
+| `packages/api-client` | Geplant: gemeinsame API-Aufrufe und Fehlerabbildung; aktuell nutzen Web und Mobile eigene Clients |
 | `deploy/` | Dockerfile, Compose-Profile und Beispiele für den TLS-Reverse-Proxy |
 | `docs/` | RFCs, Geräteanleitungen und Betrieb |
 

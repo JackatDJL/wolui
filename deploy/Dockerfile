@@ -5,7 +5,8 @@ WORKDIR /workspace
 
 COPY package.json bun.lock ./
 COPY apps/web/package.json apps/web/package.json
-RUN bun install --frozen-lockfile
+COPY apps/mobile/package.json apps/mobile/package.json
+RUN bun install --filter @wolui/web --frozen-lockfile
 
 COPY apps/web apps/web
 RUN bun run --filter @wolui/web build
@@ -15,15 +16,17 @@ WORKDIR /workspace
 COPY . .
 RUN cargo build --locked --release --package wol-server
 
+FROM tailscale/tailscale:stable AS tailscale-cli
 FROM debian:bookworm-slim AS runtime
 ENV WOLUI_ROLE=site \
-    WOLUI_LISTEN=127.0.0.1:3000 \
+    WOLUI_LISTEN=0.0.0.0:3000 \
     WOLUI_DATA_DIR=/data \
     WOLUI_ACCESS_TOKEN_FILE=/run/secrets/wolui_access_token \
-    WOLUI_WEB_DIR=/opt/wolui/web
+    WOLUI_WEB_DIR=/opt/wolui/web \
+    XDG_CONFIG_HOME=/data/.config
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates curl \
+    && apt-get install --no-install-recommends -y ca-certificates curl openssh-client \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 wolui \
     && useradd --uid 10001 --gid wolui --no-create-home --home-dir /nonexistent \
@@ -31,6 +34,7 @@ RUN apt-get update \
     && install -d -o 10001 -g 10001 /data
 
 COPY --from=server-build --chown=0:0 /workspace/target/release/wol-server /usr/local/bin/wol-server
+COPY --from=tailscale-cli --chown=0:0 /usr/local/bin/tailscale /usr/local/bin/tailscale
 COPY --from=web-build --chown=0:0 /workspace/apps/web/dist /opt/wolui/web
 
 USER 10001:10001
@@ -39,4 +43,3 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD curl --fail --silent http://127.0.0.1:3000/health/ready || exit 1
 ENTRYPOINT ["/usr/local/bin/wol-server"]
-CMD ["--allow-loopback-dev"]

@@ -1,6 +1,16 @@
 # RFC 0002 – Standorte und WOL Connect
 
-Status: Entwurf
+Status: MVP teilweise implementiert. Die aktuelle Version nutzt HTTPS-Polling; der beschriebene WSS-Kanal und eine zweite Pairing-Bestätigung bleiben geplant.
+
+## Implementierter MVP
+
+Der Hub erstellt im Management-Interface ein zehn Minuten gültiges Einmal-Token. Der Standort tauscht es über einen ausgehenden HTTPS-Aufruf gegen ein zufälliges Bearer-Credential, speichert dieses im persistenten Datenvolume mit Modus `0600` und löscht die Einladungsdatei. Der Hub speichert nur den Digest. Der Hub-Admin hat mit dem Erstellen der Einladung die Kopplung freigegeben; ein zusätzlicher Vergleichscode und eine zweite Bestätigung sind im MVP noch nicht vorhanden.
+
+Der Standort lädt Inventar-Snapshots und fragt alle fünf Sekunden nach genau einem Wake-Auftrag. Ein Auftrag wird vor Ausgabe am Hub atomar auf `accepted` gesetzt und läuft nach 30 Sekunden ab. Der Standort nutzt seinen lokalen Wake-Dispatcher und dedupliziert anhand der Hub-Auftrags-ID. Nach Ablauf oder verlorenem Ergebnis zeigt der Hub `unknown` und sendet den Auftrag nicht erneut. Snapshots enthalten Gerätenamen, MAC-Adresse, Profilname, Revision und optional den Tailscale-Namen. Remote-Inventar ist am Hub schreibgeschützt.
+
+MVP-Endpunkte: `POST /api/v1/connect/invitations`, `POST /api/v1/connect/enroll`, `POST /api/v1/connect/snapshot`, `GET /api/v1/connect/commands/next`, `POST /api/v1/connect/commands/{id}/result`, `GET /api/v1/connect/sites` und `DELETE /api/v1/connect/sites/{id}`. Das Web- und Mobil-Login gibt eine zwölf Stunden gültige Sitzung zusätzlich als `session_token` zurück; mobile Clients halten Sitzung und CSRF-Token im SecureStore und senden Schreibanforderungen weiter mit `X-CSRF-Token`.
+
+Transport-Sicherheit: Zieladressen des Connectors müssen HTTPS verwenden. Für lokale Entwicklung ist HTTP auf `localhost` zugelassen. Redirects werden abgelehnt. Das MVP verwendet kurzes Polling statt WebSockets und sendet noch keine Rollen- oder Berechtigungsstaffelung innerhalb einer Site-Verbindung. Die Kopplung berechtigt Inventar lesen und Wake auslösen. Inventar bearbeiten und Transit über andere Sites werden nicht angeboten.
 
 ## Topologie und Vertrauensgrenzen
 

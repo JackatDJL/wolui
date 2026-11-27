@@ -1,6 +1,6 @@
 # RFC 0003 – Web, Expo und Browser-SSH
 
-Status: Entwurf
+Status: Web-MVP und Expo-MVP teilweise implementiert. Gerätehinweise, native Builds und integriertes Terminal sind weitere Arbeit.
 
 ## Web und mobile Bedienung
 

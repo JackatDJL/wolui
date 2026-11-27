@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   verify:
-    name: Rust and web
+    name: Rust, web, and mobile
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -25,6 +25,10 @@ jobs:
         run: |
           bun install --frozen-lockfile
           bun run build
+      - name: Check and bundle Expo app
+        run: |
+          bun run --filter @wolui/mobile typecheck
+          bun run --filter @wolui/mobile export:android
       - name: Test Rust workspace
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt
@@ -65,6 +69,7 @@ jobs:
             --cap-drop ALL --security-opt no-new-privileges \
             --mount "type=bind,source=$scratch/token,target=/run/secrets/wolui_access_token,readonly" \
             --tmpfs /data:rw,uid=10001,gid=10001,mode=0700 \
+            -e WOLUI_LISTEN=0.0.0.0:3000 \
             -e WOLUI_PUBLIC_URL=http://localhost:3000 wolui:ci
           url=http://localhost:3000
           if ! curl --retry 25 --retry-connrefused --retry-delay 1 --fail --silent --show-error "$url/health/ready"; then
@@ -74,11 +79,12 @@ jobs:
           curl --fail --silent --show-error "$url/" -o "$scratch/index.html"
           grep -Fq '<div id="root"></div>' "$scratch/index.html"
           jq -Rn --rawfile token "$scratch/token" '{token: ($token | rtrimstr("\n"))}' |
-            curl --fail --silent --show-error --cookie-jar "$scratch/cookies" \
+            curl --fail --silent --show-error -o "$scratch/session.json" \
               -H 'Content-Type: application/json' -H "Origin: $url" \
-              --data-binary @- "$url/api/v1/sessions" |
-            jq -e '.csrf_token | length > 0'
-          curl --fail --silent --show-error --cookie "$scratch/cookies" "$url/api/v1/sites" |
+              --data-binary @- "$url/api/v1/sessions"
+          jq -e '(.csrf_token | length > 0) and (.session_token | length > 0)' "$scratch/session.json"
+          session_token=$(jq -er '.session_token' "$scratch/session.json")
+          curl --fail --silent --show-error -H "Authorization: Bearer $session_token" "$url/api/v1/sites" |
             jq -e 'length == 1 and (.[0].id | length > 0)'
       - name: Publish tested image to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

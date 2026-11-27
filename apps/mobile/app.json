@@ -1,0 +1,24 @@
+{
+  "expo": {
+    "name": "WOL UI",
+    "slug": "wolui",
+    "scheme": "wolui",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "bundleIdentifier": "foundation.djl.wolui"
+    },
+    "android": {
+      "package": "foundation.djl.wolui"
+    },
+    "plugins": [
+      [
+        "expo-secure-store",
+        {
+          "faceIDPermission": "Allow WOL UI to securely access your saved session."
+        }
+      ]
+    ]
+  }
+}

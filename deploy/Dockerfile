@@ -5,7 +5,8 @@ WORKDIR /workspace
 
 COPY package.json bun.lock ./
 COPY apps/web/package.json apps/web/package.json
-RUN bun install --frozen-lockfile
+COPY apps/mobile/package.json apps/mobile/package.json
+RUN bun install --filter @wolui/web --frozen-lockfile
 
 COPY apps/web apps/web
 RUN bun run --filter @wolui/web build
@@ -17,7 +18,7 @@ RUN cargo build --locked --release --package wol-server
 
 FROM debian:bookworm-slim AS runtime
 ENV WOLUI_ROLE=site \
-    WOLUI_LISTEN=127.0.0.1:3000 \
+    WOLUI_LISTEN=0.0.0.0:3000 \
     WOLUI_DATA_DIR=/data \
     WOLUI_ACCESS_TOKEN_FILE=/run/secrets/wolui_access_token \
     WOLUI_WEB_DIR=/opt/wolui/web
@@ -39,4 +40,3 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD curl --fail --silent http://127.0.0.1:3000/health/ready || exit 1
 ENTRYPOINT ["/usr/local/bin/wol-server"]
-CMD ["--allow-loopback-dev"]

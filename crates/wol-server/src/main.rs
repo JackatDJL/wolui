@@ -2837,6 +2837,139 @@ mod tests {
         let mut packet = [0u8; 102];
         assert!(receiver.recv_from(&mut packet).is_err());
     }
+
+    #[tokio::test]
+    async fn independent_site_connector_pairs_with_hub_and_dispatches_real_udp_wake() {
+        let (hub, _hub_receiver) = test_state().await;
+        let (mut site, receiver) = test_state().await;
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let site_id = format!("home-{}", Uuid::new_v4());
+        site.site_id = site_id.clone();
+        site.site_name = "Home".into();
+        site.role = "site".into();
+        sqlx::query("INSERT INTO devices(id,name,mac,network_profile_id,revision) VALUES('home-pc','Home PC','02:23:45:67:89:ab','test',1)")
+            .execute(&site.db)
+            .await
+            .unwrap();
+
+        let invitation = format!("wolc_{}", random_secret());
+        sqlx::query("INSERT INTO connect_invitations(token_digest,site_name,expires_at,created_at) VALUES(?,?,?,?)")
+            .bind(hex::encode(digest(&invitation)))
+            .bind("Home")
+            .bind(now() + 600)
+            .bind(now())
+            .execute(&hub.db)
+            .await
+            .unwrap();
+
+        let directory = std::env::temp_dir().join(format!("wolui-e2e-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let invitation_path = directory.join("invitation");
+        let credential_path = directory.join("credential");
+        tokio::fs::write(&invitation_path, invitation)
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let hub_router = app(hub.clone(), None);
+        let hub_server = tokio::spawn(async move {
+            axum::serve(listener, hub_router).await.unwrap();
+        });
+        let connector = tokio::spawn(run_connector(
+            site,
+            base_url.clone(),
+            invitation_path.clone(),
+            credential_path.clone(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let device_exists: i64 = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM remote_devices WHERE site_id=? AND id='home-pc')",
+                )
+                .bind(&site_id)
+                .fetch_one(&hub.db)
+                .await
+                .unwrap();
+                if device_exists == 1 {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("site connector did not pair and publish its inventory");
+        assert!(!tokio::fs::try_exists(&invitation_path).await.unwrap());
+        let stored_credential = tokio::fs::read_to_string(&credential_path).await.unwrap();
+        assert!(valid_connect_credential(stored_credential.trim()));
+
+        let session_token = random_secret();
+        let csrf_token = random_secret();
+        sqlx::query(
+            "INSERT INTO sessions(token_digest,csrf_token,created_at,expires_at) VALUES(?,?,?,?)",
+        )
+        .bind(hex::encode(digest(&session_token)))
+        .bind(&csrf_token)
+        .bind(now())
+        .bind(now() + 300)
+        .execute(&hub.db)
+        .await
+        .unwrap();
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{base_url}/api/v1/sites/{site_id}/devices/home-pc/wake"
+            ))
+            .bearer_auth(&session_token)
+            .header("origin", "http://localhost")
+            .header("x-csrf-token", &csrf_token)
+            .header("idempotency-key", "independent-site-wake")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let wake: WakeOutput = response.json().await.unwrap();
+
+        let packet_task = tokio::task::spawn_blocking(move || {
+            let mut packet = [0u8; 102];
+            let (size, _) = receiver.recv_from(&mut packet)?;
+            Ok::<_, std::io::Error>((size, packet))
+        });
+        let (size, packet) = tokio::time::timeout(Duration::from_secs(12), packet_task)
+            .await
+            .expect("site connector did not send a WOL packet")
+            .unwrap()
+            .unwrap();
+        assert_eq!(size, 102);
+        assert_eq!(&packet[..6], &[0xff; 6]);
+        assert_eq!(&packet[6..12], &[2, 0x23, 0x45, 0x67, 0x89, 0xab]);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status: String =
+                    sqlx::query_scalar("SELECT status FROM connect_commands WHERE id=?")
+                        .bind(&wake.id)
+                        .fetch_one(&hub.db)
+                        .await
+                        .unwrap();
+                if status == "sent" {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("hub did not receive the site wake result");
+
+        connector.abort();
+        hub_server.abort();
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
 }
 
 #[derive(Deserialize)]

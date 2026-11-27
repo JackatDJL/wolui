@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Linking,
@@ -77,28 +77,60 @@ function App() {
   const [selectedSite, setSelectedSite] = useState('')
   const [jobs, setJobs] = useState<Record<string, WakeJob>>({})
   const [waking, setWaking] = useState<string | null>(null)
+  const refreshGeneration = useRef(0)
+  const credentialsRef = useRef(credentials)
+  const selectedSiteRef = useRef(selectedSite)
 
   const selectedSiteName = sites.find(site => site.id === selectedSite)?.name ?? 'Standort'
   const selectedSiteOnline = sites.find(site => site.id === selectedSite)?.online ?? false
   const sortedDevices = useMemo(() => [...devices].sort((a, b) => a.name.localeCompare(b.name)), [devices])
 
   const clearSession = useCallback(async () => {
+    refreshGeneration.current += 1
+    credentialsRef.current = null
+    selectedSiteRef.current = ''
     await SecureStore.deleteItemAsync(CREDENTIALS_KEY)
     setCredentials(null)
+    setSelectedSite('')
+    setRefreshing(false)
+    setError('')
     setSites([])
     setProfiles([])
     setDevices([])
     setJobs({})
   }, [])
 
+  const selectSite = useCallback((siteId: string) => {
+    if (selectedSiteRef.current === siteId) return
+    refreshGeneration.current += 1
+    selectedSiteRef.current = siteId
+    setSelectedSite(siteId)
+    setDevices([])
+    setProfiles([])
+    setJobs({})
+    setWaking(null)
+    setError('')
+  }, [])
+
   const refresh = useCallback(async (auth = credentials, siteId = selectedSite) => {
     if (!auth) return
+    const generation = ++refreshGeneration.current
+    let expectedSite = siteId
+    const isCurrent = () => generation === refreshGeneration.current
+      && credentialsRef.current?.baseUrl === auth.baseUrl
+      && credentialsRef.current?.sessionToken === auth.sessionToken
+      && selectedSiteRef.current === expectedSite
     setRefreshing(true)
     setError('')
     try {
       const nextSites = await api<Site[]>(auth, '/api/v1/sites')
+      if (!isCurrent()) return
       setSites(nextSites)
-      const currentSite = nextSites.some(site => site.id === siteId) ? siteId : nextSites[0]?.id ?? ''
+      const currentSite = nextSites.some(site => site.id === expectedSite) ? expectedSite : nextSites[0]?.id ?? ''
+      if (currentSite !== expectedSite) {
+        selectedSiteRef.current = currentSite
+        expectedSite = currentSite
+      }
       setSelectedSite(currentSite)
       if (!currentSite) {
         setDevices([])
@@ -110,14 +142,16 @@ function App() {
         api<Device[]>(auth, sitePath + '/devices'),
         api<Profile[]>(auth, sitePath + '/network-profiles'),
       ])
+      if (!isCurrent()) return
       setDevices(nextDevices)
       setProfiles(nextProfiles)
     } catch (caught) {
+      if (!isCurrent()) return
       const message = caught instanceof Error ? caught.message : 'Die Verbindung zum Server ist fehlgeschlagen.'
       setError(message)
       if (/session|authentifiz|unauthorized/i.test(message)) await clearSession()
     } finally {
-      setRefreshing(false)
+      if (isCurrent()) setRefreshing(false)
     }
   }, [clearSession, credentials, selectedSite])
 
@@ -127,6 +161,7 @@ function App() {
       .then(saved => {
         if (!mounted || !saved) return
         const restored = JSON.parse(saved) as Credentials
+        credentialsRef.current = restored
         setCredentials(restored)
         setBaseUrl(restored.baseUrl)
       })
@@ -142,17 +177,43 @@ function App() {
   useEffect(() => { setJobs({}) }, [selectedSite])
 
   useEffect(() => {
-    const pending = Object.entries(jobs).filter(([, job]) => ['queued', 'sending', 'pending', 'accepted'].includes(job.status))
-    if (!credentials || !selectedSite || pending.length === 0) return
-    const timer = setTimeout(() => {
-      void Promise.all(pending.map(async ([deviceId, job]) => {
-        try {
-          const next = await api<WakeJob>(credentials, '/api/v1/sites/' + encodeURIComponent(selectedSite) + '/wake-jobs/' + encodeURIComponent(job.id))
-          setJobs(current => ({ ...current, [deviceId]: next }))
-        } catch { /* status remains visible and refresh can retry */ }
+    if (!credentials || !selectedSite) return
+    const auth = credentials
+    const siteId = selectedSite
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const isCurrent = () => !cancelled
+      && credentialsRef.current?.baseUrl === auth.baseUrl
+      && credentialsRef.current?.sessionToken === auth.sessionToken
+      && selectedSiteRef.current === siteId
+    const poll = async () => {
+      if (!isCurrent()) return
+      const pending = Object.entries(jobs).filter(([, job]) => ['queued', 'sending', 'pending', 'accepted'].includes(job.status))
+      if (pending.length === 0) return
+      const updates = await Promise.allSettled(pending.map(async ([deviceId, job]) => {
+        const next = await api<WakeJob>(auth, '/api/v1/sites/' + encodeURIComponent(siteId) + '/wake-jobs/' + encodeURIComponent(job.id))
+        return { deviceId, jobId: job.id, next }
       }))
-    }, 1400)
-    return () => clearTimeout(timer)
+      if (!isCurrent()) return
+      setJobs(current => {
+        if (!isCurrent()) return current
+        const updated = { ...current }
+        for (const result of updates) {
+          if (result.status === 'fulfilled' && updated[result.value.deviceId]?.id === result.value.jobId) {
+            updated[result.value.deviceId] = result.value.next
+          }
+        }
+        return updated
+      })
+      // Schedule the next attempt independently of state changes so a transient
+      // network failure cannot leave a pending job stuck forever.
+      timer = setTimeout(() => { void poll() }, 1400)
+    }
+    timer = setTimeout(() => { void poll() }, 1400)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
   }, [credentials, jobs, selectedSite])
 
   async function signIn() {
@@ -176,6 +237,9 @@ function App() {
       }
       const next: Credentials = { baseUrl: origin, sessionToken: result.session_token, csrfToken: result.csrf_token }
       await SecureStore.setItemAsync(CREDENTIALS_KEY, JSON.stringify(next))
+      refreshGeneration.current += 1
+      credentialsRef.current = next
+      selectedSiteRef.current = ''
       setBaseUrl(origin)
       setCredentials(next)
       setAccessToken('')
@@ -252,7 +316,7 @@ function App() {
         <View style={[styles.liveDot, !selectedSiteOnline && styles.offlineDot]} />
       </View>
       {sites.length > 1 ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.siteRail}>
-        {sites.map(site => <Pressable key={site.id} onPress={() => setSelectedSite(site.id)} style={[styles.siteChip, site.id === selectedSite && styles.siteChipSelected]}><Text style={[styles.siteChipText, site.id === selectedSite && styles.siteChipTextSelected]}>{site.name}{site.local ? ' · lokal' : site.online ? ' · online' : ' · offline'}</Text></Pressable>)}
+        {sites.map(site => <Pressable key={site.id} onPress={() => selectSite(site.id)} style={[styles.siteChip, site.id === selectedSite && styles.siteChipSelected]}><Text style={[styles.siteChipText, site.id === selectedSite && styles.siteChipTextSelected]}>{site.name}{site.local ? ' · lokal' : site.online ? ' · online' : ' · offline'}</Text></Pressable>)}
       </ScrollView> : null}
       {error ? <View style={styles.errorBox}><Text style={styles.error}>{error}</Text><Pressable onPress={() => void refresh()}><Text style={styles.retry}>Erneut versuchen</Text></Pressable></View> : null}
       <View style={styles.sectionHeading}><Text style={styles.sectionTitle}>Alle Geräte</Text><Text style={styles.count}>{devices.length}</Text></View>

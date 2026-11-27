@@ -1,7 +1,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        DefaultBodyLimit, Path, State,
     },
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -40,6 +40,8 @@ use wol_core::{Device, MacAddress};
 
 const SESSION_COOKIE: &str = "wolui_session";
 const SESSION_SECONDS: i64 = 12 * 60 * 60;
+const MAX_PROFILE_NAME_BYTES: usize = 256;
+const MAX_CONNECT_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Serialize)]
 struct ApiError {
@@ -521,7 +523,10 @@ async fn enroll(State(state): State<AppState>, Json(input): Json<EnrollInput>) -
     Json(EnrollOutput { credential }).into_response()
 }
 
-async fn connect_site_id(state: &AppState, headers: &HeaderMap) -> Result<String, Response> {
+async fn connect_site_id(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(String, String), Response> {
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
@@ -533,10 +538,11 @@ async fn connect_site_id(state: &AppState, headers: &HeaderMap) -> Result<String
                 "A Connect credential is required",
             )
         })?;
+    let token_digest = hex::encode(digest(bearer));
     let site_id = sqlx::query_scalar::<_, String>(
         "SELECT id FROM connect_sites WHERE token_digest=? AND active=1 AND is_local=0",
     )
-    .bind(hex::encode(digest(bearer)))
+    .bind(&token_digest)
     .fetch_optional(&state.db)
     .await
     .map_err(|_| {
@@ -546,13 +552,30 @@ async fn connect_site_id(state: &AppState, headers: &HeaderMap) -> Result<String
             "Could not validate Connect credential",
         )
     })?;
-    site_id.ok_or_else(|| {
-        error(
-            StatusCode::UNAUTHORIZED,
-            "connect_unauthorized",
-            "Connect credential is invalid or revoked",
-        )
-    })
+    site_id
+        .map(|site_id| (site_id, token_digest))
+        .ok_or_else(|| {
+            error(
+                StatusCode::UNAUTHORIZED,
+                "connect_unauthorized",
+                "Connect credential is invalid or revoked",
+            )
+        })
+}
+
+async fn connect_credential_is_current(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    site_id: &str,
+    token_digest: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS(SELECT 1 FROM connect_sites WHERE id=? AND token_digest=? AND active=1 AND is_local=0)",
+    )
+    .bind(site_id)
+    .bind(token_digest)
+    .fetch_one(&mut **tx)
+    .await
+    .map(|exists| exists == 1)
 }
 
 async fn connect_snapshot(
@@ -560,7 +583,7 @@ async fn connect_snapshot(
     headers: HeaderMap,
     Json(input): Json<SnapshotInput>,
 ) -> Response {
-    let site_id = match connect_site_id(&state, &headers).await {
+    let (site_id, token_digest) = match connect_site_id(&state, &headers).await {
         Ok(id) => id,
         Err(r) => return r,
     };
@@ -581,7 +604,7 @@ async fn connect_snapshot(
         if profile.id.is_empty()
             || profile.id.len() > 80
             || profile.name.trim().is_empty()
-            || profile.name.len() > 120
+            || profile.name.len() > MAX_PROFILE_NAME_BYTES
         {
             return error(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -633,6 +656,23 @@ async fn connect_snapshot(
             )
         }
     };
+    match connect_credential_is_current(&mut tx, &site_id, &token_digest).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return error(
+                StatusCode::UNAUTHORIZED,
+                "connect_unauthorized",
+                "Connect credential is invalid or revoked",
+            )
+        }
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Could not validate Connect credential",
+            )
+        }
+    }
     if sqlx::query("DELETE FROM remote_devices WHERE site_id=?")
         .bind(&site_id)
         .execute(&mut *tx)
@@ -657,14 +697,20 @@ async fn connect_snapshot(
             return error(StatusCode::INTERNAL_SERVER_ERROR,"internal_error","Could not write site inventory");
         }
     }
-    if sqlx::query("UPDATE connect_sites SET last_seen_at=? WHERE id=? AND active=1")
+    let heartbeat = sqlx::query("UPDATE connect_sites SET last_seen_at=? WHERE id=? AND active=1 AND is_local=0 AND token_digest=?")
         .bind(now())
         .bind(&site_id)
+        .bind(&token_digest)
         .execute(&mut *tx)
-        .await
-        .is_err()
-        || tx.commit().await.is_err()
-    {
+        .await;
+    if !matches!(heartbeat, Ok(ref result) if result.rows_affected() == 1) {
+        return error(
+            StatusCode::UNAUTHORIZED,
+            "connect_unauthorized",
+            "Connect credential is invalid or revoked",
+        );
+    }
+    if tx.commit().await.is_err() {
         return error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -675,11 +721,10 @@ async fn connect_snapshot(
 }
 
 async fn next_connect_command(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let site_id = match connect_site_id(&state, &headers).await {
+    let (site_id, token_digest) = match connect_site_id(&state, &headers).await {
         Ok(id) => id,
         Err(r) => return r,
     };
-    let _ = sqlx::query("UPDATE connect_commands SET status='unknown' WHERE site_id=? AND status IN ('queued','accepted') AND expires_at<=?").bind(&site_id).bind(now()).execute(&state.db).await;
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
         Err(_) => {
@@ -690,6 +735,27 @@ async fn next_connect_command(State(state): State<AppState>, headers: HeaderMap)
             )
         }
     };
+    match connect_credential_is_current(&mut tx, &site_id, &token_digest).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return error(
+                StatusCode::UNAUTHORIZED,
+                "connect_unauthorized",
+                "Connect credential is invalid or revoked",
+            )
+        }
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Could not validate Connect credential",
+            )
+        }
+    }
+    if sqlx::query("UPDATE connect_commands SET status='unknown' WHERE site_id=? AND status IN ('queued','accepted') AND expires_at<=? AND EXISTS(SELECT 1 FROM connect_sites WHERE id=? AND token_digest=? AND active=1 AND is_local=0)")
+        .bind(&site_id).bind(now()).bind(&site_id).bind(&token_digest).execute(&mut *tx).await.is_err() {
+        return error(StatusCode::INTERNAL_SERVER_ERROR,"internal_error","Could not expire queued commands");
+    }
     let row = sqlx::query_as::<_,(String,String,i64)>("SELECT id,device_id,expires_at FROM connect_commands WHERE site_id=? AND status='queued' AND expires_at>? ORDER BY created_at LIMIT 1")
         .bind(&site_id).bind(now()).fetch_optional(&mut *tx).await;
     let Some((id, device_id, expires_at)) = (match row {
@@ -702,15 +768,29 @@ async fn next_connect_command(State(state): State<AppState>, headers: HeaderMap)
             )
         }
     }) else {
+        if tx.commit().await.is_err() {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Could not commit command poll",
+            );
+        }
         return StatusCode::NO_CONTENT.into_response();
     };
-    if sqlx::query("UPDATE connect_commands SET status='accepted' WHERE id=? AND status='queued'")
+    let reservation = sqlx::query("UPDATE connect_commands SET status='accepted' WHERE id=? AND status='queued' AND EXISTS(SELECT 1 FROM connect_sites WHERE id=? AND token_digest=? AND active=1 AND is_local=0)")
         .bind(&id)
+        .bind(&site_id)
+        .bind(&token_digest)
         .execute(&mut *tx)
-        .await
-        .is_err()
-        || tx.commit().await.is_err()
-    {
+        .await;
+    if !matches!(reservation, Ok(ref result) if result.rows_affected() == 1) {
+        return error(
+            StatusCode::CONFLICT,
+            "command_unavailable",
+            "Wake command could not be reserved",
+        );
+    }
+    if tx.commit().await.is_err() {
         return error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -731,7 +811,7 @@ async fn connect_command_result(
     Path(id): Path<String>,
     Json(input): Json<CommandResult>,
 ) -> Response {
-    let site_id = match connect_site_id(&state, &headers).await {
+    let (site_id, token_digest) = match connect_site_id(&state, &headers).await {
         Ok(id) => id,
         Err(r) => return r,
     };
@@ -742,8 +822,8 @@ async fn connect_command_result(
             "Command result status is invalid",
         );
     }
-    match sqlx::query("UPDATE connect_commands SET status=? WHERE id=? AND site_id=? AND status='accepted' AND expires_at>?")
-        .bind(&input.status).bind(id).bind(site_id).bind(now()).execute(&state.db).await {
+    match sqlx::query("UPDATE connect_commands SET status=? WHERE id=? AND site_id=? AND status='accepted' AND expires_at>? AND EXISTS(SELECT 1 FROM connect_sites WHERE id=? AND token_digest=? AND active=1 AND is_local=0)")
+        .bind(&input.status).bind(id).bind(&site_id).bind(now()).bind(&site_id).bind(&token_digest).execute(&state.db).await {
         Ok(result) if result.rows_affected()==1 => StatusCode::NO_CONTENT.into_response(),
         Ok(_) => error(StatusCode::CONFLICT,"command_expired","Command is expired, unknown, or already completed"),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR,"internal_error","Could not record wake result"),
@@ -1214,6 +1294,28 @@ async fn wake(
         );
     };
     if site != state.site_id {
+        if let Some((job, status, device_id)) = match sqlx::query_as::<_, (String, String, String)>(
+            "SELECT id,status,device_id FROM connect_commands WHERE site_id=? AND idempotency_key=?",
+        )
+        .bind(&site)
+        .bind(key)
+        .fetch_optional(&state.db)
+        .await
+        {
+            Ok(existing) => existing,
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "Could not check remote wake idempotency",
+                )
+            }
+        } {
+            if device_id != id {
+                return error(StatusCode::CONFLICT,"idempotency_conflict","This Idempotency-Key was used for a different operation");
+            }
+            return (StatusCode::ACCEPTED,Json(WakeOutput{id:job,status})).into_response();
+        }
         let remote = sqlx::query_as::<_, (Option<i64>,)>(
             "SELECT last_seen_at FROM connect_sites WHERE id=? AND is_local=0 AND active=1",
         )
@@ -1254,11 +1356,6 @@ async fn wake(
                 "device_not_found",
                 "Device not found",
             );
-        }
-        if let Ok(Some((job,status,device_id))) = sqlx::query_as::<_,(String,String,String)>("SELECT id,status,device_id FROM connect_commands WHERE site_id=? AND idempotency_key=?")
-            .bind(&site).bind(key).fetch_optional(&state.db).await {
-            if device_id != id { return error(StatusCode::CONFLICT,"idempotency_conflict","This Idempotency-Key was used for a different operation"); }
-            return (StatusCode::ACCEPTED,Json(WakeOutput{id:job,status})).into_response();
         }
         let job = Uuid::new_v4().to_string();
         match sqlx::query("INSERT INTO connect_commands(id,site_id,device_id,idempotency_key,status,expires_at,created_at) VALUES(?,?,?,?,'queued',?,?)")
@@ -1772,12 +1869,14 @@ async fn dispatch_local_wake(
             .unwrap_or("failed"),
         _ => "failed",
     };
-    sqlx::query("UPDATE wake_jobs SET status=? WHERE id=?")
+    if let Err(err) = sqlx::query("UPDATE wake_jobs SET status=? WHERE id=?")
         .bind(status)
         .bind(&job)
         .execute(&state.db)
         .await
-        .map_err(|_| "Could not persist wake result")?;
+    {
+        tracing::error!(%err, wake_job_id=%job, observed_status=status, "Magic packet result could not be persisted");
+    }
     Ok(WakeOutput {
         id: job,
         status: status.into(),
@@ -1803,21 +1902,54 @@ async fn persist_connector_credential(
     path: &PathBuf,
     credential: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+    if !valid_connect_credential(credential) {
+        return Err("refusing to persist an invalid WOL Connect credential".into());
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    use std::io::Write;
-    file.write_all(credential.as_bytes())?;
-    file.sync_all()?;
+    let target = path.clone();
+    let credential = credential.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        use std::io::Write;
+
+        let parent = target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let name = target
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("connect-token"))
+            .to_string_lossy();
+        let temporary = parent.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
+        let result = (|| {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            file.write_all(credential.as_bytes())?;
+            file.sync_all()?;
+            // hard_link publishes atomically and refuses to replace an existing credential.
+            std::fs::hard_link(&temporary, &target)?;
+            std::fs::remove_file(&temporary)?;
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
+    })
+    .await??;
     Ok(())
+}
+
+fn valid_connect_credential(credential: &str) -> bool {
+    credential.strip_prefix("wols_").is_some_and(|secret| {
+        secret.len() == 48 && secret.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
 }
 
 async fn run_connector(
@@ -1846,7 +1978,11 @@ async fn run_connector(
         }
     };
     let mut credential = match tokio::fs::read_to_string(&credential_path).await {
-        Ok(value) => Some(value.trim().to_owned()),
+        Ok(value) if valid_connect_credential(value.trim()) => Some(value.trim().to_owned()),
+        Ok(_) => {
+            tracing::error!(path=%credential_path.display(),"Stored WOL Connect credential is empty or malformed; remove it and re-pair this site");
+            return;
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => {
             tracing::error!(%err,"Could not read WOL Connect credential");
@@ -1992,7 +2128,10 @@ fn app(state: AppState, web_dir: Option<PathBuf>) -> Router {
             axum::routing::delete(revoke_connect_site),
         )
         .route("/api/v1/connect/enroll", post(enroll))
-        .route("/api/v1/connect/snapshot", post(connect_snapshot))
+        .route(
+            "/api/v1/connect/snapshot",
+            post(connect_snapshot).layer(DefaultBodyLimit::max(MAX_CONNECT_SNAPSHOT_BYTES)),
+        )
         .route("/api/v1/connect/commands/next", get(next_connect_command))
         .route(
             "/api/v1/connect/commands/:id/result",
@@ -2379,7 +2518,8 @@ mod tests {
                 .fetch_one(&state.db)
                 .await
                 .unwrap();
-        let snapshot = serde_json::json!({"site_name":"School","profiles":[{"id":"school-lan","name":"School LAN"}],"devices":[{"id":"school-pc","name":"School PC","mac":"02:23:45:67:89:ab","network_profile_id":"school-lan","network_profile_name":"School LAN","tailscale_name":"school-pc.tailnet.ts.net","ssh_enabled":true,"ssh_username":"admin","revision":1}]});
+        let long_profile_name = "L".repeat(121);
+        let snapshot = serde_json::json!({"site_name":"School","profiles":[{"id":"school-lan","name":long_profile_name}],"devices":[{"id":"school-pc","name":"School PC","mac":"02:23:45:67:89:ab","network_profile_id":"school-lan","network_profile_name":"School LAN","tailscale_name":"school-pc.tailnet.ts.net","ssh_enabled":true,"ssh_username":"admin","revision":1}]});
         let snapshot_response = router
             .clone()
             .oneshot(
@@ -2392,6 +2532,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(snapshot_response.status(), StatusCode::NO_CONTENT);
+        let stored_profile_name: String = sqlx::query_scalar(
+            "SELECT network_profile_name FROM remote_devices WHERE site_id=? AND id='school-pc'",
+        )
+        .bind(&remote_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(stored_profile_name.len(), 121);
 
         let sites_response = router
             .clone()
@@ -2511,6 +2659,21 @@ mod tests {
             .execute(&state.db)
             .await
             .unwrap();
+        let mut repeated_wake = auth_write(
+            format!("/api/v1/sites/{remote_id}/devices/school-pc/wake"),
+            serde_json::json!({}),
+        );
+        repeated_wake
+            .headers_mut()
+            .insert("idempotency-key", "school-wake-1".parse().unwrap());
+        let repeated = router.clone().oneshot(repeated_wake).await.unwrap();
+        assert_eq!(repeated.status(), StatusCode::ACCEPTED);
+        let repeated: WakeOutput =
+            serde_json::from_slice(&to_bytes(repeated.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(repeated.id, queued.id);
+        assert_eq!(repeated.status, "sent");
+
         let mut offline_request = auth_write(
             format!("/api/v1/sites/{remote_id}/devices/school-pc/wake"),
             serde_json::json!({}),
@@ -2538,6 +2701,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rotated_connect_credential_cannot_poll_or_mutate_site_inventory() {
+        let (state, _receiver) = test_state().await;
+        let old_credential = format!("wols_{}", "a".repeat(48));
+        let new_credential = format!("wols_{}", "b".repeat(48));
+        sqlx::query("INSERT INTO connect_sites(id,name,token_digest,is_local,active,last_seen_at,created_at) VALUES('remote','Remote',?,0,1,?,?)")
+            .bind(hex::encode(digest(&old_credential)))
+            .bind(now())
+            .bind(now())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO remote_devices(site_id,id,name,mac,network_profile_id,network_profile_name,revision) VALUES('remote','pc','Remote PC','02:23:45:67:89:ab','lan','LAN',1)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO connect_commands(id,site_id,device_id,idempotency_key,status,expires_at,created_at) VALUES('job','remote','pc','key','queued',?,?)")
+            .bind(now() + 30)
+            .bind(now())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE connect_sites SET token_digest=? WHERE id='remote'")
+            .bind(hex::encode(digest(&new_credential)))
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        let router = app(state.clone(), None);
+        let poll = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/connect/commands/next")
+                    .header("authorization", format!("Bearer {old_credential}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), StatusCode::UNAUTHORIZED);
+        let result = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/connect/commands/job/result")
+                    .header("authorization", format!("Bearer {old_credential}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"status":"sent"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status(), StatusCode::UNAUTHORIZED);
+        let snapshot = router
+            .oneshot(
+                Request::post("/api/v1/connect/snapshot")
+                    .header("authorization", format!("Bearer {old_credential}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"site_name":"Overwritten","profiles":[],"devices":[]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.status(), StatusCode::UNAUTHORIZED);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM connect_commands WHERE id='job'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(status, "queued");
+        let name: String = sqlx::query_scalar("SELECT name FROM connect_sites WHERE id='remote'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(name, "Remote");
+    }
+
+    #[tokio::test]
+    async fn connector_credential_is_published_atomically_and_never_overwritten() {
+        let directory = std::env::temp_dir().join(format!("wolui-credential-{}", Uuid::new_v4()));
+        let path = directory.join("connect-token");
+        let credential = format!("wols_{}", "a".repeat(48));
+        persist_connector_credential(&path, &credential)
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), credential);
+        assert!(
+            persist_connector_credential(&path, &format!("wols_{}", "b".repeat(48)))
+                .await
+                .is_err()
+        );
+        assert!(persist_connector_credential(&directory.join("invalid"), "")
+            .await
+            .is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }
 
@@ -2573,10 +2842,13 @@ async fn load_profiles(db: &SqlitePool) -> Result<(), Box<dyn std::error::Error>
         for p in profiles {
             if p.id.trim().is_empty()
                 || p.name.trim().is_empty()
+                || p.name.len() > MAX_PROFILE_NAME_BYTES
                 || p.interface.trim().is_empty()
                 || p.port == 0
             {
-                return Err("invalid WOLUI_NETWORK_PROFILES entry".into());
+                return Err(
+                    "invalid WOLUI_NETWORK_PROFILES entry (name must be 1 to 256 bytes)".into(),
+                );
             }
             sqlx::query("INSERT INTO network_profiles(id,name,interface,bind_address,broadcast_address,port) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,interface=excluded.interface,bind_address=excluded.bind_address,broadcast_address=excluded.broadcast_address,port=excluded.port")
                 .bind(p.id).bind(p.name).bind(p.interface).bind(p.bind_address.to_string()).bind(p.broadcast_address.to_string()).bind(p.port).execute(db).await?;

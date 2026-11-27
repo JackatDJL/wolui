@@ -1831,6 +1831,7 @@ async fn dispatch_local_wake(
     state: &AppState,
     device_id: &str,
     key: &str,
+    deadline: Option<i64>,
 ) -> Result<WakeOutput, &'static str> {
     if let Some((id, status, existing_device)) = sqlx::query_as::<_, (String, String, String)>(
         "SELECT id,status,device_id FROM wake_jobs WHERE idempotency_key=?",
@@ -1859,15 +1860,19 @@ async fn dispatch_local_wake(
         }
         return Err("Could not reserve wake request");
     }
-    let status = match (
-        mac.parse::<MacAddress>(),
-        bind.parse::<Ipv4Addr>(),
-        broadcast.parse::<Ipv4Addr>(),
-    ) {
-        (Ok(mac), Ok(bind), Ok(broadcast)) => send_magic_packet(mac, bind, broadcast, port)
-            .map(|_| "sent")
-            .unwrap_or("failed"),
-        _ => "failed",
+    let status = if deadline.is_some_and(|deadline| deadline <= now()) {
+        "unknown"
+    } else {
+        match (
+            mac.parse::<MacAddress>(),
+            bind.parse::<Ipv4Addr>(),
+            broadcast.parse::<Ipv4Addr>(),
+        ) {
+            (Ok(mac), Ok(bind), Ok(broadcast)) => send_magic_packet(mac, bind, broadcast, port)
+                .map(|_| "sent")
+                .unwrap_or("failed"),
+            _ => "failed",
+        }
     };
     if let Err(err) = sqlx::query("UPDATE wake_jobs SET status=? WHERE id=?")
         .bind(status)
@@ -2084,6 +2089,7 @@ async fn run_connector(
                                 &state,
                                 &command.device_id,
                                 &format!("connect:{}", command.id),
+                                Some(command.expires_at),
                             )
                             .await
                             .map(|job| job.status)
@@ -2807,6 +2813,29 @@ mod tests {
             );
         }
         tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_connect_command_does_not_send_a_magic_packet() {
+        let (state, receiver) = test_state().await;
+        sqlx::query("INSERT INTO devices(id,name,mac,network_profile_id,revision) VALUES('device','PC','02:23:45:67:89:ab','test',1)")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let result = dispatch_local_wake(&state, "device", "expired-connect-job", Some(now() - 1))
+            .await
+            .unwrap();
+        assert_eq!(result.status, "unknown");
+        let stored_status: String = sqlx::query_scalar(
+            "SELECT status FROM wake_jobs WHERE idempotency_key='expired-connect-job'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(stored_status, "unknown");
+        receiver.set_nonblocking(true).unwrap();
+        let mut packet = [0u8; 102];
+        assert!(receiver.recv_from(&mut packet).is_err());
     }
 }
 
